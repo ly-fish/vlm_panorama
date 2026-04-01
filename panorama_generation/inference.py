@@ -11,7 +11,7 @@ output_dir = os.path.join(base_dir, "output_image")
 
 image = pipe(
     # "This is a panorama. The image shows a medieval castle stands proudly on a hilltop surrounded by autumn forests, with golden light spilling across the landscape.",
-    "This is a panorama. A small cottage in the center of a flower field, surrounded by blooming pink, white, and purple wildflowers. A stone path leads to the door. Rolling hills and a blue sky with clouds in the distance, dreamy and soft, illustration style, 360° panoramic image.",
+    "A cozy reading corner in panoramic view, surrounded by wooden bookshelves, soft lighting, a sofa and a small table with books and coffee, creating a warm atmosphere.",
     width=2048,
     height=1024,
     num_inference_steps=28,
