@@ -211,9 +211,9 @@ def edit_panorama(
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    input_path = os.path.join(base_dir, "input_image", "robot_dog.png")
-    prompt = "这是一幅全景图，请在图中加一张桌子，并且放置一个机械臂在桌子上，机器狗放在地上。"
-    use_aesg = True
+    input_path = os.path.join(base_dir, "input_image", "field.png")
+    prompt = "这是一张360° 全景图，请在保持整体托斯卡纳乡村风格不变的前提下，对前景与中景进行精细编辑：在画面中央偏右、通往庄园的小路旁新增一处小型露天休息区，包含一张木质长桌、两把藤编椅、一盏复古铁艺地灯，以及几盆陶土花盆中的薰衣草和迷迭香；在长桌上放一本摊开的旅行笔记、一只玻璃水壶和两个透明杯子。请在前景麦田边缘加入几簇自然分布的红色罂粟花和野草，使其与原有田埂和道路自然衔接。要求新增物体与现有光照方向、阴影长度、色温、透视关系一致，材质真实，细节丰富，木纹、藤编纹理、陶土颗粒感清晰可见。请特别保证360°全景图左右边界的视觉连续性，不出现接缝、拉伸、重复纹理或几何断裂；远处庄园、柏树、丘陵和天空结构保持不变，不要破坏原始场景的宁静、电影感和广角全景空间深度。"
+    use_aesg = False
     suffix = "_aesg" if use_aesg else ""
     output_path = os.path.join(base_dir, "output_image", f"output_image_edit_2511{suffix}.png")
     result = edit_panorama(
