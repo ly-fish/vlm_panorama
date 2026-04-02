@@ -28,6 +28,7 @@ from diffusers.utils import is_torch_xla_available, logging, replace_example_doc
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutput
+from modules.hcfm import fuse_prompt_conditions
 
 
 if is_torch_xla_available():
@@ -538,6 +539,8 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         output_type: str | None = "pil",
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        aesg_condition: dict[str, Any] | None = None,
+        aesg_config: dict[str, Any] | None = None,
         callback_on_step_end: Callable[[int, int], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
@@ -715,6 +718,12 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
+        )
+        prompt_embeds, prompt_embeds_mask, _ = fuse_prompt_conditions(
+            text_states=prompt_embeds,
+            text_mask=prompt_embeds_mask,
+            aesg_cond=aesg_condition,
+            config=aesg_config,
         )
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
