@@ -18,7 +18,7 @@ try:
     import torch
 
     from aesg.encoder import encode_aesg
-    from aesg.schema import AESGGraph, build_aesg_graph, normalize_scene_graph
+    from aesg.schema import AESGGraph, build_aesg_graph, build_aesg_prompt, normalize_scene_graph
     from modules.hcfm import fuse_prompt_conditions
 
     TORCH_AVAILABLE = True
@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
     encode_aesg = None
     AESGGraph = None
     build_aesg_graph = None
+    build_aesg_prompt = None
     normalize_scene_graph = None
     fuse_prompt_conditions = None
     TORCH_AVAILABLE = False
@@ -78,6 +79,12 @@ class AESGPipelineTests(unittest.TestCase):
         self.assertEqual(tuple(cond["anchor_tokens"].shape), (1, 2, 32))
         self.assertEqual(cond["branch_masks"]["anchor"].dtype, torch.bool)
 
+    def test_prompt_summary_contains_constraints(self) -> None:
+        graph = build_aesg_graph(text="test", scene_graph=self.scene_graph)
+        prompt = build_aesg_prompt(graph)
+        self.assertIn("lab table", prompt)
+        self.assertIn("center_of", prompt)
+
     def test_fusion_extends_prompt(self) -> None:
         graph = build_aesg_graph(text="test", scene_graph=self.scene_graph)
         cond = encode_aesg(graph, hidden_size=16)
@@ -91,6 +98,7 @@ class AESGPipelineTests(unittest.TestCase):
         image = Image.new("RGB", (400, 200), color="white")
         graph = build_aesg_graph(text="test", scene_graph=self.scene_graph)
         roi = localize_and_project_roi(image, graph)
+        self.assertIn("confidence", roi["projection_meta"])
         edited = Image.new("RGB", roi["local_image"].size, color="red")
         merged = reproject_to_erp(image, edited, roi, feather_radius=0)
         self.assertEqual(merged.size, image.size)

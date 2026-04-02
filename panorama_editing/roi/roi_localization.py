@@ -31,6 +31,11 @@ def localize_and_project_roi(
         fov = float(roi_hint.get("fov", fov))
     else:
         theta, phi = _infer_angles_from_graph(aesg_graph)
+    confidence = 0.2
+    if roi_hint:
+        confidence = 1.0
+    elif _has_explicit_localization(aesg_graph):
+        confidence = 0.75
 
     center_x = int(((theta + math.pi) / (2 * math.pi)) * width) % width
     center_y = int(((math.pi / 2 - phi) / math.pi) * height)
@@ -62,6 +67,7 @@ def localize_and_project_roi(
             "center_y": center_y,
             "erp_size": (width, height),
             "strategy": "heuristic_crop",
+            "confidence": confidence,
         },
     }
 
@@ -83,3 +89,26 @@ def _infer_angles_from_graph(graph: AESGGraph) -> tuple[float, float]:
     elif "down" in text or "ground" in text or "floor" in text:
         phi = -math.pi / 8
     return theta, phi
+
+
+def _has_explicit_localization(graph: AESGGraph) -> bool:
+    text = " ".join(
+        [rel.relation_type for rel in graph.relations]
+        + [rel.direction for rel in graph.relations]
+        + [obj.action for obj in graph.core_objects]
+    ).lower()
+    tokens = (
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "center",
+        "front",
+        "back",
+        "ground",
+        "floor",
+        "ceiling",
+        "near",
+        "beside",
+    )
+    return any(token in text for token in tokens)

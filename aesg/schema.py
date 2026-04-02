@@ -246,6 +246,47 @@ def build_aesg_graph(text: str, scene_graph: dict[str, Any] | None = None, aesg_
     return graph
 
 
+def build_aesg_prompt(graph: AESGGraph) -> str:
+    parts: list[str] = []
+    anchor_text = " ".join(
+        value for value in [graph.anchor.scene_type, graph.anchor.subject, graph.anchor.teaching_stage] if value
+    ).strip()
+    if anchor_text:
+        parts.append(f"Scene intent: {anchor_text}.")
+
+    if graph.core_objects:
+        objects = []
+        for obj in graph.core_objects[:6]:
+            snippet = obj.name
+            if obj.action:
+                snippet = f"{snippet} at {obj.action}"
+            if obj.physical_parent:
+                snippet = f"{snippet}, attached to {obj.physical_parent}"
+            objects.append(snippet)
+        parts.append("Primary teaching objects: " + "; ".join(objects) + ".")
+
+    if graph.relations:
+        relations = []
+        for rel in graph.relations[:6]:
+            relations.append(f"{rel.source} {rel.relation_type} {rel.target}")
+        parts.append("Keep spatial relations: " + "; ".join(relations) + ".")
+
+    if graph.context_objects:
+        context = []
+        for obj in graph.context_objects[:4]:
+            snippet = obj.name
+            if obj.visual_neighborhood:
+                snippet = f"{snippet} near {obj.visual_neighborhood}"
+            context.append(snippet)
+        parts.append("Preserve supporting context: " + "; ".join(context) + ".")
+
+    constraints = graph.graph_meta.get("safety_constraints", [])
+    if constraints:
+        parts.append("Safety constraints: " + "; ".join(str(item) for item in constraints[:3]) + ".")
+
+    return " ".join(parts).strip()
+
+
 def _infer_distance(relation_type: str) -> str:
     relation_type = relation_type.lower()
     if any(token in relation_type for token in ("near", "next", "beside", "on", "inside")):

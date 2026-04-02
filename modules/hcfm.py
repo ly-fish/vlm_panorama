@@ -39,6 +39,8 @@ def fuse_prompt_conditions(
 ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     if aesg_cond is None:
         return text_states, text_mask, {"enabled_branches": [], "num_condition_tokens": 0}
+    if config and not bool(config.get("use_token_conditioning", False)):
+        return text_states, text_mask, {"enabled_branches": [], "num_condition_tokens": 0, "skipped": True}
 
     fused_tokens = [text_states]
     fused_masks = [
