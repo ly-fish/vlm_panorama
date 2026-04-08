@@ -161,18 +161,34 @@ def reprojection_consistency_loss(
     ground-truth ERP pixels that correspond to the same region (already
     cropped to the perspective view size and supplied as gt_erp_local).
 
+    Strategy
+    --------
+    * If *mask* is provided and non-empty, compute L1 inside the masked
+      region (the edited area) **plus** an unweighted boundary term on the
+      full patch so the loss is never zero.
+    * If mask is empty or not provided, fall back to full-patch L1 —
+      this avoids the degenerate L_pano = 0 when the target object has no
+      pixels inside the perspective crop.
+
     Args:
         pred_persp:    [B, 3, H_p, W_p] predicted perspective image.
         gt_erp_local:  [B, 3, H_p, W_p] GT ERP pixels (perspective-projected).
-        mask:          Optional [B, 1, H_p, W_p] mask weighting the loss.
+        mask:          Optional [B, 1, H_p, W_p] mask (1 = edited region).
 
     Returns:
         Scalar loss.
     """
     diff = (pred_persp - gt_erp_local).abs()
-    if mask is not None:
-        diff = diff * mask
-        return diff.sum() / (mask.sum() * 3 + 1e-6)
+
+    mask_sum = mask.sum() if mask is not None else 0
+    if mask is not None and mask_sum > 0:
+        # Masked-region term (inpainting quality in ERP context)
+        masked_loss = (diff * mask).sum() / (mask_sum * 3 + 1e-6)
+        # Full-patch boundary term (prevents L_pano collapsing to 0)
+        full_loss = diff.mean()
+        return 0.7 * masked_loss + 0.3 * full_loss
+
+    # Fallback: full-patch L1 — always non-zero, gives geometric signal
     return diff.mean()
 
 

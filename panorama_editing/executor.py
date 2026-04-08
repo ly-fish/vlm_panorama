@@ -211,9 +211,11 @@ def edit_panorama(
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    input_path = os.path.join(base_dir, "input_image", "robot_dog.png")
-    prompt = "这是一张360° ERP全景图，请编辑为未来感机器人实验室巡检场景：保留左下角机器狗，在其前方添加一台白银色自动补给车，顶部有电池盒、传感器和发光面板；在机器狗与中央玻璃舱之间加入蓝白色半透明导航路径，并带有轻微地面反射；在玻璃舱内加入隐约可见的机械臂和淡蓝色工作灯；在左右控制台附近增加少量透明数据屏、接口面板和维修工具。要求新增内容与室内全景图的透视、尺度、遮挡、冷光照明、玻璃反射和极简实验室风格一致，并保证360°左右边界无接缝、无错位、无重复纹理。"
+    # input_path = os.path.join(base_dir, "input_image", "robot_dog.png")
+    input_path = r"/users/2522553y/liangyue_ws/qwen_image/input_image/robot_dog.png"
+    prompt = "这是一张360° ERP全景图，请在机器狗的左边增加一个绿色方凳子"
     use_aesg = True
+    
     suffix = "_aesg" if use_aesg else ""
     output_path = os.path.join(base_dir, "output_image", f"output_image_edit_2511{suffix}.png")
     result = edit_panorama(

@@ -225,20 +225,23 @@ def train_stage2(args: argparse.Namespace) -> None:
     ).to(device)
 
     # ------------------------------------------------------------------
-    # Freeze pano components; set up param groups
+    # Parameter groups
     # ------------------------------------------------------------------
-    # Freeze LoRA-Pano (train at 10x lower LR via param group)
+    # Real backbone (Qwen): frozen — only LoRA adapters train.
+    # Stub backbone: keep training so Stage 2 can build on Stage 1 weights.
+    if not use_stub:
+        for p in backbone.parameters():
+            p.requires_grad_(False)
+
+    # Separate pano params (10× lower LR) from everything else
     pano_params, new_params = [], []
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         if "distortion_enc" in name or "lora_pano_adapter" in name:
             pano_params.append(param)
         else:
-            param.requires_grad_(True)
             new_params.append(param)
-
-    # Also unfreeze backbone stub
-    for p in backbone.parameters():
-        p.requires_grad_(False)   # freeze backbone itself in Stage 2
 
     optimizer = torch.optim.AdamW(
         [

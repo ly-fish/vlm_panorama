@@ -1,123 +1,124 @@
-"""Inference: panorama editing with trained Dual-LoRA weights.
+"""Inference: panorama editing with Dual-LoRA on top of Qwen-Image-Edit-2511.
 
-End-to-end pipeline (mirrors Section 9 of the technical document):
+This script wraps the existing ``panorama_editing.executor`` pipeline and adds
+Dual-LoRA geometric + semantic conditioning on top.  The Qwen backbone call is
+identical to the already-working executor; the only difference is that every
+DualLoRAFusion layer is primed with (z_theta, z_G, gamma_p, gamma_s) before
+the pipeline runs so the LoRA deltas are applied to every cross-attention layer.
 
-  Step 1  User provides panoramic image P and editing instruction T.
-  Step 2  AESG graph G parsed from T; encoder produces Z_G.
-  Step 3  AESG-driven ROI localisation; distortion encoder produces z_theta.
-  Step 4  Object-level mask M generated (Grounded-SAM / AESG spatial relation).
-  Step 5  Target region projected to perspective view I_p.
-  Step 6  Qwen-Image-Edit-2511 (or stub) edits I_p with adapted W' = W +
-          gamma_p * delta_W_pano(theta) + gamma_s * delta_W_aesg(Z_G).
-  Step 7  Edited perspective reprojected to ERP with boundary correction.
-  Step 8  (Optional) Educational consistency post-check.
+Minimal usage — only panorama and prompt are required:
 
-Usage:
     python -m inference.edit_with_lora \\
         --input  data/train/scene_000/panorama.jpg \\
-        --prompt "Replace the wooden bench with a modern laboratory workstation" \\
+        --prompt "Replace the wooden bench with a red modern chair" \\
         --stage2_ckpt checkpoints/stage2/best_checkpoint.pt \\
-        --output output_edited.jpg
+        --output  output_edited.jpg
+
+If --stage2_ckpt is omitted the script runs the base Qwen pipeline without
+any LoRA conditioning (useful as a baseline).
+
+Model loading: the Qwen backbone is loaded exactly as executor.get_pipeline()
+does — using the HuggingFace model ID "Qwen/Qwen-Image-Edit-2511" (or the
+local path provided via --backbone_path).  The model is cached in HF cache
+after the first download.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import numpy as np
 import torch
 from PIL import Image
 
-from data.erp_utils import (
-    erp_to_perspective,
-    reproject_perspective_to_erp,
-    extract_binary_mask,
-    dilate_mask,
-    compute_aesg_dilation_radius,
-    compute_affiliation_edges,
-)
 from lora.distortion_encoder import DistortionEncoder, ProjectionParams
 from lora.lora_aesg import AESGConditionAggregator
 from lora.gating import AdaptiveGatingNetwork
+from lora.dual_lora_fusion import DualLoRAFusion, patch_model_with_dual_lora
 
 
 # ---------------------------------------------------------------------------
-# Mask helper: load from Grounded-SAM or derive from AESG spatial relations
+# Condition injection context manager
 # ---------------------------------------------------------------------------
 
-def load_mask_from_scene(
-    mask_jpg_path: str | Path,
-    mask_json_path: str | Path,
-    target_label: str | None = None,
-    logit_threshold: float = 0.5,
-) -> tuple[np.ndarray, list[dict]]:
-    """Load binary mask and detections from a scene's mask files.
-
-    Args:
-        mask_jpg_path:   Path to *_mask.jpg semantic ID map.
-        mask_json_path:  Path to *_mask.json detections.
-        target_label:    If given, select the detection whose label contains this string.
-                         Otherwise the highest-confidence detection is chosen.
-        logit_threshold: Minimum confidence to keep a detection.
-
-    Returns:
-        (binary_mask [H, W] uint8,  list of detections)
-    """
-    import json as _json
-    with open(mask_json_path, "r", encoding="utf-8") as f:
-        detections = _json.load(f)
-
-    valid = [
-        d for d in detections
-        if d.get("value", 0) != 0
-        and d.get("logit", 0.0) >= logit_threshold
-        and "box" in d
-    ]
-    if not valid:
-        raise ValueError("No valid detections above logit threshold.")
-
-    if target_label is not None:
-        matches = [d for d in valid if target_label.lower() in d.get("label", "").lower()]
-        chosen = matches[0] if matches else max(valid, key=lambda d: d.get("logit", 0.0))
-    else:
-        chosen = max(valid, key=lambda d: d.get("logit", 0.0))
-
-    mask_img = np.array(Image.open(mask_jpg_path).convert("L"))
-    aff_counts = compute_affiliation_edges(detections)
-    num_aff = aff_counts.get(chosen["value"], 0)
-    radius = compute_aesg_dilation_radius(chosen["box"], num_aff)
-    bin_mask = extract_binary_mask(mask_img, chosen["value"])
-    dilated  = dilate_mask(bin_mask, radius)
-    return dilated, detections, chosen
+@contextmanager
+def _primed_lora(
+    fusion_layers: dict[str, DualLoRAFusion],
+    z_theta: torch.Tensor,
+    z_G: torch.Tensor | None,
+    gamma_p: torch.Tensor,
+    gamma_s: torch.Tensor | None,
+):
+    """Prime every DualLoRAFusion layer before the pipeline call, reset after."""
+    for layer in fusion_layers.values():
+        layer.prime(z_theta, z_G, gamma_p, gamma_s)
+    try:
+        yield
+    finally:
+        for layer in fusion_layers.values():
+            layer.reset_prime()
 
 
 # ---------------------------------------------------------------------------
-# LoRA-conditioned editing function
+# Main editor
 # ---------------------------------------------------------------------------
 
 class PanoramaEditorWithLoRA:
-    """Full inference pipeline with trained Dual-LoRA weights.
+    """Dual-LoRA inference wrapper around the existing Qwen-Image-Edit-2511 pipeline.
 
     Args:
-        stage2_ckpt:   Path to Stage 2 checkpoint (or Stage 1 if stage2 unavailable).
-        backbone_path: Path to Qwen-Image-Edit-2511 model (or None for stub inference).
-        device:        Torch device string.
+        stage2_ckpt:   Path to Stage 2 checkpoint (contains LoRA weights).
+        stage1_ckpt:   Path to Stage 1 checkpoint (fallback).
+        backbone_path: HuggingFace model ID or local path to Qwen-Image-Edit-2511.
+                       Defaults to "Qwen/Qwen-Image-Edit-2511".
+        device:        "cuda" | "cpu" | "auto".
+        lora_rank:     LoRA rank used during training (default 8).
     """
 
     def __init__(
         self,
         stage2_ckpt: str | Path | None = None,
         stage1_ckpt: str | Path | None = None,
-        backbone_path: str | Path | None = None,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        backbone_path: str = "Qwen/Qwen-Image-Edit-2511",
+        device: str = "auto",
+        lora_rank: int = 8,
     ) -> None:
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        # Build LoRA components
+        # ------------------------------------------------------------------
+        # Load Qwen pipeline exactly as executor.get_pipeline() does
+        # ------------------------------------------------------------------
+        from panorama_editing.qwen_image_editing.pipeline_qwenimage_edit_plus import (
+            QwenImageEditPlusPipeline,
+        )
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        print(f"[Editor] Loading Qwen pipeline from '{backbone_path}' ...")
+        self.pipeline = QwenImageEditPlusPipeline.from_pretrained(
+            backbone_path, torch_dtype=dtype
+        ).to(self.device)
+        self.pipeline.set_progress_bar_config(disable=None)
+        print("[Editor] Qwen pipeline ready.")
+
+        # ------------------------------------------------------------------
+        # Patch transformer with DualLoRA
+        # ------------------------------------------------------------------
+        self.fusion_layers: dict[str, DualLoRAFusion] = patch_model_with_dual_lora(
+            self.pipeline.transformer,
+            rank=lora_rank,
+            pano_cond_dim=512,
+            aesg_cond_dim=512,
+        )
+        print(f"[Editor] Patched {len(self.fusion_layers)} attention layers with DualLoRA.")
+
+        # ------------------------------------------------------------------
+        # Shared condition encoders
+        # ------------------------------------------------------------------
         self.distortion_enc = DistortionEncoder(
             hidden_dim=256, out_dim=512, num_frequencies=8
         ).to(self.device).eval()
@@ -128,7 +129,9 @@ class PanoramaEditorWithLoRA:
             pano_cond_dim=512, aesg_cond_dim=512
         ).to(self.device).eval()
 
-        # Load weights
+        # ------------------------------------------------------------------
+        # Load LoRA weights from checkpoint
+        # ------------------------------------------------------------------
         ckpt_path = stage2_ckpt or stage1_ckpt
         if ckpt_path and Path(ckpt_path).exists():
             ckpt = torch.load(ckpt_path, map_location=self.device)
@@ -138,227 +141,192 @@ class PanoramaEditorWithLoRA:
                 self.aesg_aggregator.load_state_dict(ckpt["aesg_aggregator"])
             if "gating" in ckpt:
                 self.gating.load_state_dict(ckpt["gating"])
+            self._load_lora_adapters(ckpt)
             print(f"[Editor] Loaded LoRA weights from {ckpt_path}")
+        else:
+            print(
+                "[Editor] No checkpoint provided — running with untrained LoRA weights. "
+                "The output is equivalent to the base Qwen model."
+            )
 
-        # Optionally load backbone
-        self.pipeline = None
-        self.backbone_stub = None
-        if backbone_path and Path(backbone_path).exists():
-            try:
-                from panorama_editing.qwen_image_editing.pipeline_qwenimage_edit_plus import (
-                    QwenImageEditPlusPipeline,
-                )
-                dtype = torch.bfloat16 if device == "cuda" else torch.float32
-                self.pipeline = QwenImageEditPlusPipeline.from_pretrained(
-                    str(backbone_path), torch_dtype=dtype
-                ).to(self.device)
-                print("[Editor] Qwen backbone loaded.")
-            except Exception as exc:
-                print(f"[Editor] WARNING: backbone load failed ({exc}), using stub.")
+        self._has_lora = bool(ckpt_path and Path(ckpt_path).exists())
 
-        if self.pipeline is None:
-            from training.train_stage1 import _PatchReconNet
-            self.backbone_stub = _PatchReconNet(base_ch=64).to(self.device).eval()
-            if ckpt_path and Path(ckpt_path).exists() and "backbone" in ckpt:
-                self.backbone_stub.load_state_dict(ckpt["backbone"])
+    def _load_lora_adapters(self, ckpt: dict) -> None:
+        loaded = 0
+        for layer_name, layer in self.fusion_layers.items():
+            safe = layer_name.replace(".", "__")
+            if f"lora_pano__{safe}" in ckpt:
+                layer.lora_pano_adapter.load_state_dict(ckpt[f"lora_pano__{safe}"])
+                loaded += 1
+            if f"lora_aesg__{safe}" in ckpt:
+                layer.lora_aesg_adapter.load_state_dict(ckpt[f"lora_aesg__{safe}"])
+        if loaded:
+            print(f"[Editor] Loaded LoRA adapter weights for {loaded} layers.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def edit(
         self,
         panorama: str | Path | Image.Image,
         prompt: str,
-        mask_jpg: str | Path | None = None,
-        mask_json: str | Path | None = None,
-        target_label: str | None = None,
-        fov: float = 90.0,
-        perspective_size: tuple[int, int] = (512, 512),
         task_type: str = "inpaint",
         save_intermediates: bool = False,
     ) -> dict:
         """Edit a panoramic image.
 
         Args:
-            panorama:     Path to ERP panorama or PIL Image.
-            prompt:       User editing instruction.
-            mask_jpg:     Path to *_mask.jpg (optional, enables AESG masking).
-            mask_json:    Path to *_mask.json (optional).
-            target_label: Label substring to select target object.
-            fov:          Perspective FoV in degrees.
-            perspective_size: (H, W) of the perspective view.
-            task_type:    "reconstruct" | "inpaint".
-            save_intermediates: Whether to include intermediate images in result.
+            panorama:          Path to ERP panorama image or PIL Image.
+            prompt:            Natural-language editing instruction.
+            task_type:         "reconstruct" | "inpaint".
+            save_intermediates: Include intermediate data in result dict.
 
         Returns:
-            dict with "edited_panorama" (PIL Image) and optional intermediates.
+            dict with "edited_panorama" (PIL Image) and, when
+            save_intermediates=True, "gamma_p", "gamma_s", "roi_result",
+            "effective_prompt", "aesg_prompt".
         """
-        # Load panorama
+        from aesg.schema import build_aesg_graph, build_aesg_prompt
+        from aesg.encoder import encode_aesg
+        from panorama_editing.executor import load_config
+        from panorama_editing.roi.roi_localization import localize_and_project_roi
+        from panorama_editing.reproject import reproject_to_erp
+
         if isinstance(panorama, (str, Path)):
             pano_img = Image.open(panorama).convert("RGB")
         else:
             pano_img = panorama.convert("RGB")
-        pano_arr = np.array(pano_img)
+
+        config = load_config()
+
+        # ------------------------------------------------------------------
+        # Build AESG graph and condition tokens (same as executor)
+        # ------------------------------------------------------------------
+        aesg_graph = build_aesg_graph(text=prompt)
+        condition_tokens = encode_aesg(aesg_graph)   # dict of tensors, used by Qwen pipeline
+        aesg_prompt = build_aesg_prompt(aesg_graph)
+        effective_prompt = prompt
+        if aesg_prompt:
+            effective_prompt = f"{prompt}\n\nStructured constraints: {aesg_prompt}"
+
+        # ------------------------------------------------------------------
+        # ROI localisation (same as executor with use_local_editing=True)
+        # ------------------------------------------------------------------
+        roi_result = localize_and_project_roi(pano_img, aesg_graph, config=config)
         W_erp, H_erp = pano_img.size
 
-        # ------------------------------------------------------------------
-        # Step 2: Parse AESG
-        # ------------------------------------------------------------------
-        aesg_cond = self._build_aesg(prompt)
+        # Convert ROI angles to ProjectionParams for LoRA-Pano encoding
+        # roi_result["theta"] = azimuth (lon), roi_result["phi"] = elevation (lat)
+        proj_params = ProjectionParams(
+            lat=float(roi_result["phi"]),
+            lon=float(roi_result["theta"]),
+            fov=float(roi_result["fov"]),
+        )
 
         # ------------------------------------------------------------------
-        # Step 3: Compute projection parameters from mask or scene centre
+        # Encode LoRA conditions
         # ------------------------------------------------------------------
-        chosen_det = None
-        erp_mask = np.zeros((H_erp, W_erp), dtype=np.uint8)
+        theta_t = proj_params.to_tensor(self.device)
+        z_theta = self.distortion_enc(theta_t)
 
-        if mask_jpg and mask_json and Path(mask_jpg).exists() and Path(mask_json).exists():
-            try:
-                erp_mask, detections, chosen_det = load_mask_from_scene(
-                    mask_jpg, mask_json, target_label=target_label
-                )
-            except ValueError:
-                print("[Editor] WARNING: mask loading failed, using full image.")
-
-        if chosen_det is not None:
-            proj_params = ProjectionParams.from_box(chosen_det["box"], W_erp, H_erp, fov=fov)
-        else:
-            proj_params = ProjectionParams(lat=0.0, lon=0.0, fov=fov)
-
-        # Encode geometric condition
-        theta_tensor = proj_params.to_tensor(self.device)         # [1, 3]
-        z_theta = self.distortion_enc(theta_tensor)               # [1, 512]
-
-        # Encode AESG condition
-        z_G = self.aesg_aggregator(aesg_cond, task_type=task_type)  # [1, 512]
-
-        # Gate values
+        # Build AESG tensor condition for LoRA-AESG (same tokens, different shape)
+        z_G = self.aesg_aggregator(
+            self._aesg_tokens_to_lora_cond(condition_tokens),
+            task_type=task_type,
+        )
         gamma_p, gamma_s = self.gating(z_theta, z_G, task_type=task_type)
 
         print(
-            f"[Editor] lat={proj_params.lat:.1f}° lon={proj_params.lon:.1f}° fov={fov}°  "
+            f"[Editor] lat={proj_params.lat:.2f} lon={proj_params.lon:.2f} "
+            f"fov={proj_params.fov:.1f}  "
             f"gamma_p={gamma_p.item():.3f}  gamma_s={gamma_s.item():.3f}"
         )
 
         # ------------------------------------------------------------------
-        # Step 4-5: Project to perspective, apply mask
+        # Call Qwen pipeline with LoRA conditions primed in every fusion layer
         # ------------------------------------------------------------------
-        H_p, W_p = perspective_size
-        persp_img, sample_map = erp_to_perspective(
-            pano_img, proj_params.lat, proj_params.lon, fov, out_w=W_p, out_h=H_p
+        gen = torch.Generator(device=self.device).manual_seed(42)
+
+        # When no valid LoRA weights, skip priming (identity delta)
+        ctx = (
+            _primed_lora(self.fusion_layers, z_theta, z_G, gamma_p, gamma_s)
+            if self._has_lora
+            else _noop_ctx()
         )
 
-        # ------------------------------------------------------------------
-        # Step 6: Edit with backbone
-        # ------------------------------------------------------------------
-        if self.pipeline is not None:
-            edited_persp = self._edit_with_qwen(
-                persp_img, prompt, erp_mask, sample_map,
-                z_theta=z_theta, z_G=z_G, gamma_p=gamma_p, gamma_s=gamma_s,
-            )
-        else:
-            edited_persp = self._edit_with_stub(
-                persp_img, erp_mask, sample_map, z_theta, z_G, gamma_s
-            )
+        local_img = roi_result["local_image"]
+        confidence = float(roi_result["projection_meta"].get("confidence", 0.0))
+        use_local = confidence >= float(config.get("roi_confidence_threshold", 0.7))
 
-        # ------------------------------------------------------------------
-        # Step 7: Reproject to ERP
-        # ------------------------------------------------------------------
-        edited_arr = reproject_perspective_to_erp(
-            erp_base=pano_arr,
-            persp_patch=np.array(edited_persp),
-            sample_map=sample_map,
-            erp_mask=erp_mask if erp_mask.any() else np.ones((H_erp, W_erp), dtype=np.uint8) * 255,
-            feather_px=8,
-        )
-        result_img = Image.fromarray(edited_arr)
+        with ctx:
+            if use_local:
+                edited_local = self.pipeline(
+                    image=[local_img],
+                    prompt=effective_prompt,
+                    generator=gen,
+                    true_cfg_scale=4.0,
+                    negative_prompt=" ",
+                    num_inference_steps=40,
+                    guidance_scale=1.0,
+                    num_images_per_prompt=1,
+                    aesg_condition=condition_tokens,
+                    aesg_config=config,
+                ).images[0]
+                final_img = reproject_to_erp(pano_img, edited_local, roi_result)
+            else:
+                # Low confidence → edit full panorama (same as executor fallback)
+                final_img = self.pipeline(
+                    image=[pano_img],
+                    prompt=effective_prompt,
+                    generator=gen,
+                    true_cfg_scale=4.0,
+                    negative_prompt=" ",
+                    num_inference_steps=40,
+                    guidance_scale=1.0,
+                    num_images_per_prompt=1,
+                    aesg_condition=condition_tokens,
+                    aesg_config=config,
+                ).images[0]
+                edited_local = None
 
-        out = {"edited_panorama": result_img}
+        out: dict = {"edited_panorama": final_img}
         if save_intermediates:
-            out["perspective_view"]   = persp_img
-            out["edited_perspective"] = edited_persp
-            out["gamma_p"]            = float(gamma_p.item())
-            out["gamma_s"]            = float(gamma_s.item())
-            out["proj_params"]        = {"lat": proj_params.lat, "lon": proj_params.lon, "fov": fov}
+            out["gamma_p"] = float(gamma_p.item())
+            out["gamma_s"] = float(gamma_s.item())
+            out["roi_result"] = roi_result
+            out["effective_prompt"] = effective_prompt
+            out["aesg_prompt"] = aesg_prompt
+            if edited_local is not None:
+                out["edited_local"] = edited_local
         return out
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
 
-    def _build_aesg(self, text: str) -> dict:
-        """Build a minimal AESG condition dict from the editing prompt."""
-        try:
-            from aesg.schema import build_aesg_graph
-            from aesg.encoder import AESGEncoder
-            graph = build_aesg_graph(text=text)
-            encoder = AESGEncoder(hidden_size=3584)
-            return encoder(graph).to_dict()
-        except Exception:
-            H = 3584
-            return {
-                "anchor_tokens":   torch.zeros(1, 2, H),
-                "object_tokens":   torch.zeros(1, 8, H),
-                "context_tokens":  torch.zeros(1, 8, H),
-                "relation_tokens": torch.zeros(1, 12, H),
-            }
+    def _aesg_tokens_to_lora_cond(self, condition_tokens: dict) -> dict:
+        """Move encode_aesg() output tensors to the correct device.
 
-    def _edit_with_qwen(
-        self,
-        persp_img: Image.Image,
-        prompt: str,
-        erp_mask: np.ndarray,
-        sample_map: np.ndarray,
-        z_theta: torch.Tensor,
-        z_G: torch.Tensor,
-        gamma_p: torch.Tensor,
-        gamma_s: torch.Tensor,
-    ) -> Image.Image:
-        """Run Qwen pipeline with LoRA-conditioned weights."""
-        from data.erp_utils import project_mask_to_perspective
-        from lora.lora_layer import ConditionalLoRALayer
+        encode_aesg() already returns {"anchor_tokens", "object_tokens",
+        "context_tokens", "relation_tokens"} — exactly what AESGConditionAggregator
+        expects.  We just ensure each tensor is [1, N, H] and on self.device.
+        """
+        H = 3584
+        keys = ["anchor_tokens", "object_tokens", "context_tokens", "relation_tokens"]
+        result: dict = {}
+        for k in keys:
+            t = condition_tokens.get(k, torch.zeros(1, 2, H))
+            if t.dim() == 2:
+                t = t.unsqueeze(0)
+            result[k] = t.to(self.device)
+        return result
 
-        persp_mask = project_mask_to_perspective(erp_mask, sample_map)
-        mask_img = Image.fromarray(persp_mask)
 
-        # Inject conditions into all patched LoRA layers
-        # This is a forward-hook approach: we store z_theta/z_G in the pipeline context
-        # and the patched layers will pick them up via the DualLoRAFusion.forward
-        # For simplicity, we call the pipeline directly with prompt conditioning
-        gen = torch.Generator(device=self.device).manual_seed(42)
-        output = self.pipeline(
-            image=[persp_img],
-            prompt=prompt,
-            generator=gen,
-            true_cfg_scale=4.0,
-            negative_prompt=" ",
-            num_inference_steps=30,
-            guidance_scale=1.0,
-        )
-        return output.images[0]
-
-    def _edit_with_stub(
-        self,
-        persp_img: Image.Image,
-        erp_mask: np.ndarray,
-        sample_map: np.ndarray,
-        z_theta: torch.Tensor,
-        z_G: torch.Tensor,
-        gamma_s: torch.Tensor,
-    ) -> Image.Image:
-        """Edit using the lightweight stub reconstruction network."""
-        from data.erp_utils import project_mask_to_perspective
-
-        persp_arr = np.array(persp_img).astype(np.float32)
-        persp_t = torch.from_numpy(persp_arr).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-        persp_t = persp_t.to(self.device)
-
-        persp_mask = project_mask_to_perspective(erp_mask, sample_map)
-        mask_t = torch.from_numpy(persp_mask.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(self.device)
-
-        inp = torch.cat([persp_t, mask_t], dim=1)   # [1, 4, H, W]
-        pred = self.backbone_stub(inp, z_theta)      # [1, 3, H, W]
-        pred = pred.squeeze(0).permute(1, 2, 0)
-        pred = ((pred.cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-        return Image.fromarray(pred)
+@contextmanager
+def _noop_ctx():
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -366,21 +334,23 @@ class PanoramaEditorWithLoRA:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Panorama editing with Dual-LoRA")
-    parser.add_argument("--input",    required=True, help="Input ERP panorama image path")
-    parser.add_argument("--prompt",   required=True, help="Editing instruction")
-    parser.add_argument("--output",   default="output_edited.jpg", help="Output image path")
-    parser.add_argument("--mask_jpg",  default=None, help="Path to *_mask.jpg")
-    parser.add_argument("--mask_json", default=None, help="Path to *_mask.json")
-    parser.add_argument("--target_label", default=None, help="Label substring for target object")
-    parser.add_argument("--stage2_ckpt", default=None, help="Path to Stage 2 checkpoint")
-    parser.add_argument("--stage1_ckpt", default=None, help="Path to Stage 1 checkpoint (fallback)")
-    parser.add_argument("--backbone_path", default=None, help="Path to Qwen-Image-Edit-2511")
-    parser.add_argument("--fov",    type=float, default=90.0)
-    parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--task_type", default="inpaint", choices=["reconstruct", "inpaint"])
+    parser = argparse.ArgumentParser(
+        description="Dual-LoRA panorama editing.  Only --input and --prompt are required."
+    )
+    parser.add_argument("--input",   required=True, help="Input ERP panorama image")
+    parser.add_argument("--prompt",  required=True, help="Editing instruction in natural language")
+    parser.add_argument("--output",  default="output_edited.jpg")
+    parser.add_argument(
+        "--backbone_path",
+        default="Qwen/Qwen-Image-Edit-2511",
+        help="HuggingFace model ID or local path to Qwen-Image-Edit-2511",
+    )
+    parser.add_argument("--stage2_ckpt",   default=None, help="Stage 2 checkpoint (LoRA weights)")
+    parser.add_argument("--stage1_ckpt",   default=None, help="Stage 1 checkpoint (fallback)")
+    parser.add_argument("--lora_rank",     type=int, default=8)
+    parser.add_argument("--task_type",     default="inpaint", choices=["reconstruct", "inpaint"])
     parser.add_argument("--save_intermediates", action="store_true")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
 
@@ -392,16 +362,12 @@ def main() -> None:
         stage1_ckpt=args.stage1_ckpt,
         backbone_path=args.backbone_path,
         device=args.device,
+        lora_rank=args.lora_rank,
     )
 
     result = editor.edit(
         panorama=args.input,
         prompt=args.prompt,
-        mask_jpg=args.mask_jpg,
-        mask_json=args.mask_json,
-        target_label=args.target_label,
-        fov=args.fov,
-        perspective_size=(args.img_size, args.img_size),
         task_type=args.task_type,
         save_intermediates=args.save_intermediates,
     )
@@ -409,16 +375,17 @@ def main() -> None:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result["edited_panorama"].save(out_path)
-    print(f"[Editor] Saved edited panorama to {out_path}")
+    print(f"[Editor] Saved → {out_path}")
 
     if args.save_intermediates:
         stem = out_path.stem
-        result["perspective_view"].save(out_path.parent / f"{stem}_perspective.jpg")
-        result["edited_perspective"].save(out_path.parent / f"{stem}_edited_persp.jpg")
+        if "edited_local" in result:
+            result["edited_local"].save(out_path.parent / f"{stem}_local_edit.jpg")
         meta = {
-            "gamma_p": result["gamma_p"],
-            "gamma_s": result["gamma_s"],
-            "proj_params": result["proj_params"],
+            "gamma_p":          result.get("gamma_p"),
+            "gamma_s":          result.get("gamma_s"),
+            "effective_prompt": result.get("effective_prompt"),
+            "aesg_prompt":      result.get("aesg_prompt"),
         }
         with open(out_path.parent / f"{stem}_meta.json", "w") as f:
             json.dump(meta, f, indent=2)

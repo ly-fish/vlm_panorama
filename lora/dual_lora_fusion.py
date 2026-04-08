@@ -76,6 +76,35 @@ class DualLoRAFusion(nn.Module):
             dropout=dropout,
         )
 
+    # ------------------------------------------------------------------
+    # Condition injection API (used during Qwen pipeline inference)
+    # ------------------------------------------------------------------
+
+    def prime(
+        self,
+        z_theta: torch.Tensor | None,
+        z_G: torch.Tensor | None,
+        gamma_p: torch.Tensor | None,
+        gamma_s: torch.Tensor | None,
+    ) -> None:
+        """Cache LoRA conditions so the next forward() uses them automatically.
+
+        Call this on every fusion layer before running the backbone pipeline.
+        The backbone calls forward(x) without keyword args; the cached values
+        ensure the LoRA delta is still applied correctly.
+        """
+        self._cond_z_theta = z_theta
+        self._cond_z_G     = z_G
+        self._cond_gamma_p = gamma_p
+        self._cond_gamma_s = gamma_s
+
+    def reset_prime(self) -> None:
+        """Clear cached conditions after a pipeline call."""
+        self._cond_z_theta = None
+        self._cond_z_G     = None
+        self._cond_gamma_p = None
+        self._cond_gamma_s = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -87,7 +116,8 @@ class DualLoRAFusion(nn.Module):
         """
         Args:
             x:       Input [B, *, d_in].
-            z_theta: Distortion condition [B, pano_cond_dim].
+            z_theta: Distortion condition [B, pano_cond_dim].  If None, falls
+                     back to the value set by prime().
             z_G:     AESG condition [B, aesg_cond_dim].
             gamma_p: Geometric gate [B, 1]; if None, pano branch is skipped.
             gamma_s: Semantic gate [B, 1]; if None, AESG branch is skipped.
@@ -95,20 +125,32 @@ class DualLoRAFusion(nn.Module):
         Returns:
             W' x of shape [B, *, d_out].
         """
-        base_out = self._base_layer(x)
+        # Use explicitly passed values; fall back to primed cache.
+        z_theta = z_theta if z_theta is not None else getattr(self, "_cond_z_theta", None)
+        z_G     = z_G     if z_G     is not None else getattr(self, "_cond_z_G",     None)
+        gamma_p = gamma_p if gamma_p is not None else getattr(self, "_cond_gamma_p", None)
+        gamma_s = gamma_s if gamma_s is not None else getattr(self, "_cond_gamma_s", None)
 
+        base_out = self._base_layer(x)
         lora_delta = torch.zeros_like(base_out)
 
         if z_theta is not None:
-            pano_out = self.lora_pano_adapter(x, z=z_theta) - base_out   # delta only
+            # Expand batch dim if needed (pipeline may call with B=1 repeat)
+            zt = z_theta if z_theta.shape[0] == x.shape[0] else z_theta.expand(x.shape[0], -1)
+            pano_out = self.lora_pano_adapter(x, z=zt) - base_out
             gp = gamma_p if gamma_p is not None else torch.ones(x.shape[0], 1, device=x.device)
+            if gp.shape[0] != x.shape[0]:
+                gp = gp.expand(x.shape[0], -1)
             if x.dim() == 3:
                 gp = gp.unsqueeze(1)
             lora_delta = lora_delta + gp * pano_out
 
         if z_G is not None:
-            aesg_out = self.lora_aesg_adapter(x, z=z_G) - base_out       # delta only
+            zg = z_G if z_G.shape[0] == x.shape[0] else z_G.expand(x.shape[0], -1)
+            aesg_out = self.lora_aesg_adapter(x, z=zg) - base_out
             gs = gamma_s if gamma_s is not None else torch.ones(x.shape[0], 1, device=x.device)
+            if gs.shape[0] != x.shape[0]:
+                gs = gs.expand(x.shape[0], -1)
             if x.dim() == 3:
                 gs = gs.unsqueeze(1)
             lora_delta = lora_delta + gs * aesg_out

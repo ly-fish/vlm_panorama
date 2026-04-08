@@ -139,7 +139,7 @@ Key arguments:
 Loads Stage 1 weights, then jointly trains LoRA-AESG and the gating network.
 
 ```bash
-conda run -n panorama python -m training.train_stage2 \
+conda run -n panorama python -u -m training.train_stage2 \
     --data_root /users/2522553y/liangyue_ws/vlm_panorama/data \
     --stage1_ckpt ./checkpoints/stage1/best_checkpoint.pt \
     --output_dir ./checkpoints/stage2 \
@@ -162,23 +162,24 @@ Additional Stage 2 arguments:
 
 ## Inference
 
-Edit a panoramic image with the trained Dual-LoRA weights:
+Only the panorama image and an editing prompt are required. The pipeline
+automatically extracts the target object noun from the prompt and runs
+Grounded-SAM to locate and mask the region. If Grounded-SAM checkpoints are
+not available it falls back to a centre-strip crop.
 
 ```bash
 conda run -n panorama python -m inference.edit_with_lora \
-    --input   data/train/scene_000/panorama.jpg \
-    --prompt  "Replace the bench with a modern lab workstation" \
-    --mask_jpg  data/train/scene_000/result_48_mask.jpg \
-    --mask_json data/train/scene_000/result_48_mask.json \
+    --input  data/train/scene_000/panorama.jpg \
+    --prompt "Replace the bench with a modern lab workstation" \
     --stage2_ckpt ./checkpoints/stage2/best_checkpoint.pt \
-    --output  output_edited.jpg \
+    --output output_edited.jpg \
     --save_intermediates
 ```
 
 With `--save_intermediates` the script additionally saves:
-- `output_edited_perspective.jpg` — the edited perspective patch before reprojection
-- `output_edited_persp.jpg` — the original perspective crop
-- `output_edited_meta.json` — gate values (γ_p, γ_s) and projection parameters
+- `output_edited_perspective.jpg` — original perspective crop
+- `output_edited_edited_persp.jpg` — edited perspective patch before reprojection
+- `output_edited_meta.json` — gate values (γ_p, γ_s), projection parameters, detected subject and box
 
 All inference arguments:
 
@@ -187,16 +188,24 @@ All inference arguments:
 | `--input` | — | Input ERP panorama path |
 | `--prompt` | — | Natural language editing instruction |
 | `--output` | `output_edited.jpg` | Output path |
-| `--mask_jpg` | *(optional)* | Path to `*_mask.jpg` for object-level masking |
-| `--mask_json` | *(optional)* | Path to `*_mask.json` for AESG-driven dilation |
-| `--target_label` | *(auto)* | Label substring to select the target object |
 | `--stage2_ckpt` | *(optional)* | Trained Stage 2 checkpoint |
 | `--stage1_ckpt` | *(optional)* | Stage 1 checkpoint (fallback if Stage 2 unavailable) |
 | `--backbone_path` | *(optional)* | Path to Qwen-Image-Edit-2511 model |
 | `--fov` | 90.0 | Perspective field-of-view in degrees |
 | `--img_size` | 512 | Perspective patch size |
 | `--task_type` | `inpaint` | `reconstruct` or `inpaint` |
+| `--save_intermediates` | off | Save perspective crops and meta JSON |
 | `--device` | auto | `cuda` or `cpu` |
+
+### ROI detection strategy
+
+1. The subject noun is extracted from the prompt with pattern matching
+   (e.g. "Replace the **bench** with …" → `bench`).
+2. Grounded-SAM (GroundingDINO + SAM) detects and segments that noun
+   in the panorama if `checkpoints/groundingdino_swint_ogc.pth` and
+   `checkpoints/sam_vit_h_4b8939.pth` are present.
+3. If Grounded-SAM is unavailable, a centre-strip region is used as fallback.
+4. AESG-driven mask dilation is applied to the detected region before editing.
 
 ### Python API
 
@@ -212,8 +221,6 @@ editor = PanoramaEditorWithLoRA(
 result = editor.edit(
     panorama="data/train/scene_000/panorama.jpg",
     prompt="Replace the bench with a modern lab workstation",
-    mask_jpg="data/train/scene_000/result_48_mask.jpg",
-    mask_json="data/train/scene_000/result_48_mask.json",
     fov=90.0,
     task_type="inpaint",
     save_intermediates=True,
