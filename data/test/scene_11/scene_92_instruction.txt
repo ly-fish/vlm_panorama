@@ -1,0 +1,1 @@
+This is a panorama. A minimal illustration with one large line object at the center, surrounded by empty background.
