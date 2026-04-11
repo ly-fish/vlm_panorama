@@ -259,10 +259,12 @@ def train_stage1(args: argparse.Namespace) -> None:
 
         epoch_losses: dict[str, float] = {}
         for step, batch in enumerate(train_loader):
-            I_p_deg = batch["I_p_deg"].to(device)   # [B, 3, H, W]
-            I_p_GT  = batch["I_p_GT"].to(device)    # [B, 3, H, W]
-            theta   = batch["theta"].to(device)      # [B, 3]
-            mask    = batch["mask"].to(device)       # [B, 1, H, W]
+            I_p_deg    = batch["I_p_deg"].to(device)     # [B, 3, H, W]
+            I_p_GT     = batch["I_p_GT"].to(device)      # [B, 3, H, W]
+            theta      = batch["theta"].to(device)        # [B, 3]
+            mask       = batch["mask"].to(device)         # [B, 1, H, W]
+            sample_map = batch["sample_map"].to(device)   # [B, H, W, 2]
+            erp_H      = batch["meta"][0]["erp_H"]
 
             # Encode projection
             z_theta = distortion_enc(theta)           # [B, 512]
@@ -284,6 +286,8 @@ def train_stage1(args: argparse.Namespace) -> None:
                 mask=mask,
                 recon_loss_fn=recon_loss_fn,
                 lambda_pano=args.lambda_pano,
+                sample_map=sample_map,
+                erp_H=erp_H,
             )
 
             optimizer.zero_grad()
@@ -317,10 +321,12 @@ def train_stage1(args: argparse.Namespace) -> None:
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                I_p_deg = batch["I_p_deg"].to(device)
-                I_p_GT  = batch["I_p_GT"].to(device)
-                theta   = batch["theta"].to(device)
-                mask    = batch["mask"].to(device)
+                I_p_deg    = batch["I_p_deg"].to(device)
+                I_p_GT     = batch["I_p_GT"].to(device)
+                theta      = batch["theta"].to(device)
+                mask       = batch["mask"].to(device)
+                sample_map = batch["sample_map"].to(device)
+                erp_H      = batch["meta"][0]["erp_H"]
 
                 z_theta = distortion_enc(theta)
                 if use_stub:
@@ -335,6 +341,8 @@ def train_stage1(args: argparse.Namespace) -> None:
                     pred=pred, target=I_p_GT, mask=mask,
                     recon_loss_fn=recon_loss_fn,
                     lambda_pano=args.lambda_pano,
+                    sample_map=sample_map,
+                    erp_H=erp_H,
                 )
                 val_loss += losses["total"].item()
 
@@ -394,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_pano", type=float, default=0.3)
     parser.add_argument("--lambda_perc", type=float, default=0.1)
     parser.add_argument("--lambda_ssim", type=float, default=0.1)
-    parser.add_argument("--use_perceptual", action="store_true", default=True)
+    parser.add_argument("--use_perceptual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logit_threshold", type=float, default=0.5)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_every", type=int, default=20)

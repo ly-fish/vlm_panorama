@@ -11,6 +11,7 @@ Stage 2:
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -27,12 +28,16 @@ class VGGPerceptualLoss(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        from torchvision import models
+        import os
+        # Respect TORCH_HOME / custom cache; disable auto-download if no internet
         try:
-            from torchvision import models
             vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         except Exception:
-            from torchvision import models
-            vgg = models.vgg16(pretrained=True)
+            # weights not cached and no internet — fall back to random init
+            print("[VGGPerceptualLoss] WARNING: VGG16 weights unavailable, "
+                  "using random init (perceptual loss will be uninformative).", flush=True)
+            vgg = models.vgg16(weights=None)
 
         features = vgg.features
         self.slice1 = nn.Sequential(*list(features.children())[:4])    # relu1_2
@@ -154,41 +159,58 @@ def reprojection_consistency_loss(
     pred_persp: torch.Tensor,
     gt_erp_local: torch.Tensor,
     mask: torch.Tensor | None = None,
+    sample_map: torch.Tensor | None = None,
+    erp_H: int | None = None,
 ) -> torch.Tensor:
-    """Measure consistency of reprojected prediction against original ERP.
+    """Measure ERP-space reprojection consistency of the predicted patch.
 
-    In practice we compare the predicted perspective patch against the
-    ground-truth ERP pixels that correspond to the same region (already
-    cropped to the perspective view size and supplied as gt_erp_local).
+    Each perspective pixel maps to a specific ERP position via *sample_map*.
+    The ERP solid-angle element at latitude φ is proportional to cos(φ), so
+    pixels from high-latitude (polar) regions represent smaller solid angles
+    and should be weighted accordingly.  This makes the loss equivalent to
+    an L1 measured in ERP solid-angle space rather than in flat perspective
+    pixel space, giving a genuine geometric signal that L_recon (uniform
+    perspective-space MSE/L1) does not provide.
 
-    Strategy
-    --------
-    * If *mask* is provided and non-empty, compute L1 inside the masked
-      region (the edited area) **plus** an unweighted boundary term on the
-      full patch so the loss is never zero.
-    * If mask is empty or not provided, fall back to full-patch L1 —
-      this avoids the degenerate L_pano = 0 when the target object has no
-      pixels inside the perspective crop.
+    When sample_map / erp_H are not available the loss falls back to the
+    original unweighted L1.
 
     Args:
-        pred_persp:    [B, 3, H_p, W_p] predicted perspective image.
-        gt_erp_local:  [B, 3, H_p, W_p] GT ERP pixels (perspective-projected).
-        mask:          Optional [B, 1, H_p, W_p] mask (1 = edited region).
+        pred_persp:   [B, 3, H_p, W_p] predicted perspective patch.
+        gt_erp_local: [B, 3, H_p, W_p] GT pixels at the same perspective view.
+        mask:         Optional [B, 1, H_p, W_p] mask (1 = edited region).
+        sample_map:   Optional [B, H_p, W_p, 2] (u, v) ERP coordinates for
+                      each perspective pixel (from erp_to_perspective).
+        erp_H:        Height of the source ERP image in pixels (needed to
+                      convert v-coordinate to latitude).
 
     Returns:
         Scalar loss.
     """
-    diff = (pred_persp - gt_erp_local).abs()
+    diff = (pred_persp - gt_erp_local).abs()   # [B, 3, H_p, W_p]
 
+    # ------------------------------------------------------------------
+    # ERP solid-angle weighting via cos(lat)
+    # ------------------------------------------------------------------
+    if sample_map is not None and erp_H is not None and erp_H > 0:
+        # sample_map: [B, H_p, W_p, 2]; [..., 1] is the v-coordinate in ERP
+        v_map = sample_map[..., 1].to(pred_persp.device)          # [B, H_p, W_p]
+        lat_rad = (0.5 - v_map / float(erp_H)) * math.pi          # latitude ∈ (-π/2, π/2)
+        cos_lat = torch.cos(lat_rad).clamp(min=0.05)               # [B, H_p, W_p]
+        # Normalise so the mean weight is 1 → loss scale stays comparable
+        cos_lat = cos_lat / (cos_lat.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+        weight = cos_lat.unsqueeze(1)                              # [B, 1, H_p, W_p]
+        diff = diff * weight
+
+    # ------------------------------------------------------------------
+    # Masked + full-patch terms
+    # ------------------------------------------------------------------
     mask_sum = mask.sum() if mask is not None else 0
     if mask is not None and mask_sum > 0:
-        # Masked-region term (inpainting quality in ERP context)
         masked_loss = (diff * mask).sum() / (mask_sum * 3 + 1e-6)
-        # Full-patch boundary term (prevents L_pano collapsing to 0)
-        full_loss = diff.mean()
+        full_loss   = diff.mean()
         return 0.7 * masked_loss + 0.3 * full_loss
 
-    # Fallback: full-patch L1 — always non-zero, gives geometric signal
     return diff.mean()
 
 
@@ -275,6 +297,8 @@ def compute_stage1_loss(
     recon_loss_fn: ReconstructionLoss | None = None,
     lambda_pano: float = 0.3,
     config: dict[str, Any] | None = None,
+    sample_map: torch.Tensor | None = None,
+    erp_H: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute Stage 1 loss: L_recon + lambda_pano * L_pano.
 
@@ -285,6 +309,8 @@ def compute_stage1_loss(
         recon_loss_fn:   ReconstructionLoss instance (created if None).
         lambda_pano:     Weight for panoramic reprojection consistency.
         config:          Optional config dict with lambda overrides.
+        sample_map:      [B, H_p, W_p, 2] ERP (u, v) coords per perspective pixel.
+        erp_H:           Source ERP image height in pixels.
 
     Returns:
         Dict with "L_recon", "L_pano", "total" scalar tensors.
@@ -296,7 +322,9 @@ def compute_stage1_loss(
         recon_loss_fn = ReconstructionLoss()
 
     L_recon = recon_loss_fn(pred, target)
-    L_pano  = reprojection_consistency_loss(pred, target, mask=mask)
+    L_pano  = reprojection_consistency_loss(
+        pred, target, mask=mask, sample_map=sample_map, erp_H=erp_H
+    )
 
     total = L_recon + lambda_pano * L_pano
     return {"L_recon": L_recon, "L_pano": L_pano, "total": total}
@@ -313,6 +341,8 @@ def compute_stage2_loss(
     context_mask: torch.Tensor | None = None,
     pred_erp: torch.Tensor | None = None,
     config: dict[str, Any] | None = None,
+    sample_map: torch.Tensor | None = None,
+    erp_H: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute Stage 2 multi-objective loss.
 
@@ -348,7 +378,9 @@ def compute_stage2_loss(
         recon_loss_fn = ReconstructionLoss()
 
     L_recon = recon_loss_fn(pred, target)
-    L_pano  = reprojection_consistency_loss(pred, target, mask=mask)
+    L_pano  = reprojection_consistency_loss(
+        pred, target, mask=mask, sample_map=sample_map, erp_H=erp_H
+    )
     L_rel   = spatial_relation_loss(pred, target, relation_mask)
     L_aff   = affiliation_loss(pred, target, affiliation_mask)
 

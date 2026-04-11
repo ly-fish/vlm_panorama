@@ -285,11 +285,13 @@ def train_stage2(args: argparse.Namespace) -> None:
         epoch_losses: dict[str, float] = {}
 
         for step, batch in enumerate(train_loader):
-            I_p_deg = batch["I_p_deg"].to(device)
-            I_p_GT  = batch["I_p_GT"].to(device)
-            theta   = batch["theta"].to(device)
-            mask    = batch["mask"].to(device)
-            meta    = batch["meta"]
+            I_p_deg    = batch["I_p_deg"].to(device)
+            I_p_GT     = batch["I_p_GT"].to(device)
+            theta      = batch["theta"].to(device)
+            mask       = batch["mask"].to(device)
+            sample_map = batch["sample_map"].to(device)
+            erp_H      = batch["meta"][0]["erp_H"]
+            meta       = batch["meta"]
 
             # Extract AESG conditions from meta (may be None for some samples)
             aesg_condition = _gather_aesg(meta, device)
@@ -308,6 +310,8 @@ def train_stage2(args: argparse.Namespace) -> None:
                 mask=mask,
                 recon_loss_fn=recon_loss_fn,
                 config=loss_config,
+                sample_map=sample_map,
+                erp_H=erp_H,
             )
 
             optimizer.zero_grad()
@@ -343,11 +347,13 @@ def train_stage2(args: argparse.Namespace) -> None:
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                I_p_deg = batch["I_p_deg"].to(device)
-                I_p_GT  = batch["I_p_GT"].to(device)
-                theta   = batch["theta"].to(device)
-                mask    = batch["mask"].to(device)
-                meta    = batch["meta"]
+                I_p_deg    = batch["I_p_deg"].to(device)
+                I_p_GT     = batch["I_p_GT"].to(device)
+                theta      = batch["theta"].to(device)
+                mask       = batch["mask"].to(device)
+                sample_map = batch["sample_map"].to(device)
+                erp_H      = batch["meta"][0]["erp_H"]
+                meta       = batch["meta"]
 
                 aesg_condition = _gather_aesg(meta, device)
                 pred = model(
@@ -357,6 +363,7 @@ def train_stage2(args: argparse.Namespace) -> None:
                 losses = compute_stage2_loss(
                     pred=pred, target=I_p_GT, mask=mask,
                     recon_loss_fn=recon_loss_fn, config=loss_config,
+                    sample_map=sample_map, erp_H=erp_H,
                 )
                 val_loss += losses["total"].item()
 

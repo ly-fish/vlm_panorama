@@ -221,24 +221,32 @@ def extract_binary_mask(mask_img: np.ndarray, object_value: int) -> np.ndarray:
 
 def dilate_mask(
     binary_mask: np.ndarray,
-    dilation_radius: int,
+    dilation_radius: int | tuple[int, int],
 ) -> np.ndarray:
     """Apply morphological dilation to a binary mask.
 
     Args:
-        binary_mask:     [H, W] uint8 binary mask.
-        dilation_radius: Radius in pixels.
+        binary_mask:      [H, W] uint8 binary mask.
+        dilation_radius:  Radius in pixels.  Pass a (h_radius, v_radius) tuple
+                          for anisotropic dilation (e.g. latitude-compensated).
 
     Returns:
         Dilated mask [H, W] uint8.
     """
     import cv2
 
-    if dilation_radius <= 0:
+    if isinstance(dilation_radius, (tuple, list)):
+        h_radius, v_radius = int(dilation_radius[0]), int(dilation_radius[1])
+    else:
+        h_radius = v_radius = int(dilation_radius)
+
+    if h_radius <= 0 and v_radius <= 0:
         return binary_mask
-    kernel_size = 2 * dilation_radius + 1
+
+    h_radius = max(h_radius, 1)
+    v_radius = max(v_radius, 1)
     kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        cv2.MORPH_ELLIPSE, (2 * h_radius + 1, 2 * v_radius + 1)
     )
     return cv2.dilate(binary_mask, kernel)
 
@@ -246,30 +254,43 @@ def dilate_mask(
 def compute_aesg_dilation_radius(
     box: list[float],
     num_affiliation_edges: int,
+    lat_deg: float = 0.0,
     d_base_ratio: float = 0.15,
     beta: float = 0.1,
-) -> int:
-    """Compute AESG-driven semantic dilation radius.
+) -> tuple[int, int]:
+    """Compute AESG-driven semantic dilation radii with latitude compensation.
+
+    The horizontal radius is scaled by 1/cos(lat) to account for ERP
+    horizontal stretching near the poles: a physically circular region
+    occupies progressively more ERP pixels horizontally as latitude increases.
 
     d = d_base * (1 + beta * |E_aff(v_c)|)
-
-    where d_base = 15% of the object bounding box diagonal.
+    h_radius = d * (1 / cos(lat))   # compensate ERP horizontal stretch
+    v_radius = d                     # no vertical distortion in ERP
 
     Args:
-        box:                   [x1, y1, x2, y2] bounding box in pixels.
+        box:                   [x1, y1, x2, y2] bounding box in ERP pixels.
         num_affiliation_edges: Number of educational affiliation edges for this object.
+        lat_deg:               Latitude of the object centre in degrees [-90, 90].
         d_base_ratio:          Fraction of bounding box diagonal for d_base.
         beta:                  Scaling factor for affiliation degree.
 
     Returns:
-        Dilation radius in pixels (integer).
+        (h_radius, v_radius) dilation radii in pixels.
     """
     w = box[2] - box[0]
     h = box[3] - box[1]
     diagonal = math.sqrt(w**2 + h**2)
     d_base = d_base_ratio * diagonal
     d = d_base * (1.0 + beta * num_affiliation_edges)
-    return max(1, int(round(d)))
+
+    # Latitude compensation: ERP horizontal stretch = 1 / cos(lat)
+    lat_rad = math.radians(lat_deg)
+    h_stretch = 1.0 / max(math.cos(lat_rad), 0.1)   # cap at 10× to avoid extreme polar values
+
+    h_radius = max(1, int(round(d * h_stretch)))
+    v_radius = max(1, int(round(d)))
+    return h_radius, v_radius
 
 
 def compute_affiliation_edges(

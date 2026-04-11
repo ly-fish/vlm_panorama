@@ -215,13 +215,15 @@ class PanoramaDataset(Dataset):
 
         # Build flat list of (scene_meta, target_det, fov, lat_delta, lon_delta)
         self.samples: list[dict[str, Any]] = []
-        for scene_dir in scenes:
-            if not scene_dir.is_dir():
-                continue
+        valid_dirs = [s for s in scenes if s.is_dir()]
+        for i, scene_dir in enumerate(valid_dirs):
             scene = _load_scene(scene_dir)
             if scene is None:
                 continue
             self._expand_scene(scene)
+            if (i + 1) % 20 == 0 or (i + 1) == len(valid_dirs):
+                print(f"  [Dataset/{split}] {i + 1}/{len(valid_dirs)} scenes loaded, "
+                      f"{len(self.samples)} samples so far", flush=True)
 
     def _expand_scene(self, scene: dict[str, Any]) -> None:
         """Enumerate all (object, projection) samples for a scene."""
@@ -297,15 +299,20 @@ class PanoramaDataset(Dataset):
         # Step 1: Extract binary mask and apply AESG-driven dilation
         # ------------------------------------------------------------------
         num_aff = sample["num_affiliation_edges"]
-        rad = compute_aesg_dilation_radius(
-            det["box"], num_aff, d_base_ratio=0.15, beta=self.dilation_beta
+        h_rad, v_rad = compute_aesg_dilation_radius(
+            det["box"], num_aff,
+            lat_deg=lat,
+            d_base_ratio=0.15,
+            beta=self.dilation_beta,
         )
-        # Mask perturbation for augmentation
-        perturb = random.uniform(1.0 - self.mask_perturb_frac, 1.0 + self.mask_perturb_frac)
-        rad = max(1, int(round(rad * perturb)))
+        # Mask perturbation for augmentation (applied independently per axis)
+        perturb_h = random.uniform(1.0 - self.mask_perturb_frac, 1.0 + self.mask_perturb_frac)
+        perturb_v = random.uniform(1.0 - self.mask_perturb_frac, 1.0 + self.mask_perturb_frac)
+        h_rad = max(1, int(round(h_rad * perturb_h)))
+        v_rad = max(1, int(round(v_rad * perturb_v)))
 
         bin_mask_erp = extract_binary_mask(mask_img, det["value"])
-        dilated_mask = dilate_mask(bin_mask_erp, rad)  # [H, W] uint8
+        dilated_mask = dilate_mask(bin_mask_erp, (h_rad, v_rad))  # [H, W] uint8
 
         # ------------------------------------------------------------------
         # Step 2: Degrade the ERP image in the mask region
@@ -362,11 +369,12 @@ class PanoramaDataset(Dataset):
             meta["aesg_condition"] = self._build_aesg_condition(scene, det)
 
         return {
-            "I_p_deg": I_p_deg,          # [3, H_p, W_p]
-            "I_p_GT":  I_p_GT,           # [3, H_p, W_p]
-            "theta":   theta_tensor,     # [3]
-            "mask":    M_persp,          # [1, H_p, W_p]
-            "meta":    meta,
+            "I_p_deg":    I_p_deg,                           # [3, H_p, W_p]
+            "I_p_GT":     I_p_GT,                            # [3, H_p, W_p]
+            "theta":      theta_tensor,                      # [3]
+            "mask":       M_persp,                           # [1, H_p, W_p]
+            "sample_map": torch.from_numpy(sample_map),      # [H_p, W_p, 2]  (u, v) in ERP pixels
+            "meta":       meta,
         }
 
     # ------------------------------------------------------------------
@@ -402,7 +410,7 @@ class PanoramaDataset(Dataset):
 
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Custom collate that stacks tensors and aggregates meta lists."""
-    keys_tensor = ["I_p_deg", "I_p_GT", "theta", "mask"]
+    keys_tensor = ["I_p_deg", "I_p_GT", "theta", "mask", "sample_map"]
     out: dict[str, Any] = {k: torch.stack([b[k] for b in batch]) for k in keys_tensor}
     out["meta"] = [b["meta"] for b in batch]
     return out

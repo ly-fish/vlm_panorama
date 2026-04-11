@@ -1,0 +1,6 @@
+{
+  "gamma_p": 0.5474662184715271,
+  "gamma_s": 0.4864009618759155,
+  "effective_prompt": "Replace the bench with a modern lab workstation\n\nStructured constraints: Scene intent: panorama general Replace the bench with a modern lab workstation.",
+  "aesg_prompt": "Scene intent: panorama general Replace the bench with a modern lab workstation."
+}
