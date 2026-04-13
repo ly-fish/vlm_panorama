@@ -32,14 +32,24 @@ class ProjectionParams:
         return torch.tensor([[lat_n, lon_n, fov_n]], dtype=torch.float32, device=device)
 
     @staticmethod
-    def from_box(box: list[float], img_w: int, img_h: int, fov: float = 90.0) -> "ProjectionParams":
-        """Compute projection params from a Grounded-SAM bounding box.
+    def from_box(
+        box: list[float],
+        img_w: int,
+        img_h: int,
+        fov: float | None = None,
+        margin: float = 1.5,
+    ) -> "ProjectionParams":
+        """Compute projection params from a bounding box in ERP pixel coordinates.
 
         Args:
-            box:   [x1, y1, x2, y2] in pixel coordinates.
-            img_w: ERP image width in pixels.
-            img_h: ERP image height in pixels.
-            fov:   desired field-of-view in degrees.
+            box:    [x1, y1, x2, y2] in pixel coordinates.
+            img_w:  ERP image width in pixels.
+            img_h:  ERP image height in pixels.
+            fov:    Desired horizontal FoV in degrees.  If *None* (default),
+                    the FoV is computed adaptively from the box width (longitude
+                    span × ``margin``), clamped to [30°, 150°].
+            margin: Multiplicative safety margin applied to the box angular span
+                    when computing the adaptive FoV (default 1.5).
 
         Returns:
             ProjectionParams with lat/lon pointing at the box centre.
@@ -48,6 +58,13 @@ class ProjectionParams:
         cy = (box[1] + box[3]) / 2.0
         lon = (cx / img_w - 0.5) * 360.0
         lat = (0.5 - cy / img_h) * 180.0
+        if fov is None:
+            box_w = box[2] - box[0]
+            box_h = box[3] - box[1]
+            # Angular span of box in ERP space (degrees)
+            fov_from_w = (box_w / img_w) * 360.0 * margin
+            fov_from_h = (box_h / img_h) * 180.0 * margin
+            fov = float(max(30.0, min(150.0, max(fov_from_w, fov_from_h))))
         return ProjectionParams(lat=lat, lon=lon, fov=fov)
 
 

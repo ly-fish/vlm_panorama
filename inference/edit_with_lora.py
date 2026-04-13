@@ -174,6 +174,7 @@ class PanoramaEditorWithLoRA:
         prompt: str,
         task_type: str = "inpaint",
         save_intermediates: bool = False,
+        detection_text: str | None = None,
     ) -> dict:
         """Edit a panoramic image.
 
@@ -182,6 +183,10 @@ class PanoramaEditorWithLoRA:
             prompt:            Natural-language editing instruction.
             task_type:         "reconstruct" | "inpaint".
             save_intermediates: Include intermediate data in result dict.
+            detection_text:    Optional text query for the object detector
+                               (e.g. ``"wooden bench"``).  When *None* the
+                               target object name is inferred from the AESG
+                               anchor node.
 
         Returns:
             dict with "edited_panorama" (PIL Image) and, when
@@ -212,9 +217,20 @@ class PanoramaEditorWithLoRA:
             effective_prompt = f"{prompt}\n\nStructured constraints: {aesg_prompt}"
 
         # ------------------------------------------------------------------
-        # ROI localisation (same as executor with use_local_editing=True)
+        # Object detection (Grounded-SAM / DINO) → feeds precise ROI
+        # Falls back gracefully when the library is not installed.
         # ------------------------------------------------------------------
-        roi_result = localize_and_project_roi(pano_img, aesg_graph, config=config)
+        det_query = detection_text or _anchor_text_from_aesg(aesg_graph)
+        detection = _detect_object(pano_img, det_query) if det_query else None
+
+        # ------------------------------------------------------------------
+        # ROI localisation — uses detection result when available
+        # ------------------------------------------------------------------
+        roi_result = localize_and_project_roi(
+            pano_img, aesg_graph,
+            detection=detection,
+            config=config,
+        )
         W_erp, H_erp = pano_img.size
 
         # Convert ROI angles to ProjectionParams for LoRA-Pano encoding
@@ -256,12 +272,41 @@ class PanoramaEditorWithLoRA:
             else _noop_ctx()
         )
 
-        local_img = roi_result["local_image"]
+        local_img  = roi_result["local_image"]
         confidence = float(roi_result["projection_meta"].get("confidence", 0.0))
-        use_local = confidence >= float(config.get("roi_confidence_threshold", 0.7))
+        # When a real detection is available the strategy is "detection_perspective"
+        # and confidence is already clamped to ≥ 0.7 in roi_localization.  For the
+        # heuristic fallback (confidence=0.2) we skip local editing and fall back to
+        # full-panorama editing — matching the original executor behaviour.
+        threshold  = float(config.get("roi_confidence_threshold", 0.7))
+        use_local  = confidence >= threshold
 
         with ctx:
             if use_local:
+                # ----------------------------------------------------------
+                # Match training setup: degrade the local patch in the object
+                # mask region before passing to the pipeline.
+                #
+                # During training the model saw I_p_deg (masked-out / degraded
+                # perspective patch) as input, conditioned on z_theta, and
+                # learned to fill the object region with ERP-distortion-aware
+                # appearance.  Passing a clean patch at inference breaks this
+                # conditioning path — the LoRA's distortion injection never
+                # activates because the input domain doesn't match training.
+                #
+                # By applying the same degradation here we restore the
+                # train/inference alignment: the model sees a degraded patch,
+                # uses z_theta (via LoRA-Pano) to know where in the ERP this
+                # view is, and generates the object with correct spherical
+                # distortion pre-baked before reprojection.
+                # ----------------------------------------------------------
+                if self._has_lora:
+                    local_img = _degrade_local_patch(
+                        local_img,
+                        roi_result["mask"],
+                        strategy=config.get("degrade_strategy", "gray"),
+                    )
+
                 edited_local = self.pipeline(
                     image=[local_img],
                     prompt=effective_prompt,
@@ -327,6 +372,183 @@ class PanoramaEditorWithLoRA:
 @contextmanager
 def _noop_ctx():
     yield
+
+
+# ---------------------------------------------------------------------------
+# Degradation helper — matches panorama_dataset.py training setup
+# ---------------------------------------------------------------------------
+
+def _degrade_local_patch(
+    local_img: "Image.Image",
+    mask: "Image.Image",
+    strategy: str = "gray",
+) -> "Image.Image":
+    """Apply the same degradation used during LoRA training to a local patch.
+
+    During training, ``I_p_deg`` is built by replacing the object mask region
+    with gray / noise / blur before feeding into the model.  At inference,
+    applying the same degradation restores the train/inference alignment so
+    that the LoRA's z_theta-conditioned distortion injection activates
+    correctly.
+
+    Args:
+        local_img: PIL Image of the perspective patch (clean).
+        mask:      PIL Image (mode "L") marking the object region in patch
+                   coordinates (255 = object, 0 = background).
+        strategy:  ``"gray"`` | ``"noise"`` | ``"blur"`` | ``"random"``.
+                   Defaults to ``"gray"`` (most stable for inference).
+
+    Returns:
+        Degraded PIL Image of the same size as ``local_img``.
+    """
+    import numpy as np
+    import random as _random
+    from PIL import Image as _PILImage
+
+    img_arr  = np.array(local_img.convert("RGB"))
+    mask_arr = np.array(mask.convert("L"))
+
+    obj_region = mask_arr > 0
+
+    if strategy == "random":
+        strategy = _random.choice(["gray", "noise", "blur"])
+
+    if strategy == "noise":
+        noise = np.random.normal(128, 40, img_arr.shape).clip(0, 255).astype(np.uint8)
+        img_arr[obj_region] = noise[obj_region]
+    elif strategy == "blur":
+        import cv2  # type: ignore
+        sigma = 40.0
+        k = int(sigma * 3) | 1
+        blurred = cv2.GaussianBlur(img_arr, (k, k), sigma)
+        img_arr[obj_region] = blurred[obj_region]
+    else:  # "gray" (default)
+        img_arr[obj_region] = 128
+
+    return _PILImage.fromarray(img_arr)
+
+
+# ---------------------------------------------------------------------------
+# Object detection helpers
+# ---------------------------------------------------------------------------
+
+def _anchor_text_from_aesg(aesg_graph) -> str | None:
+    """Extract the anchor object name from the AESG graph for use as a
+    detection query.  Returns *None* when the graph has no anchor."""
+    try:
+        anchor = aesg_graph.anchor
+        if anchor and anchor.name:
+            return anchor.name.strip()
+    except AttributeError:
+        pass
+    # Fallback: use the first core object name
+    try:
+        if aesg_graph.core_objects:
+            return aesg_graph.core_objects[0].name.strip()
+    except (AttributeError, IndexError):
+        pass
+    return None
+
+
+def _detect_object(
+    image: "Image.Image",
+    text_query: str,
+    box_threshold: float = 0.35,
+    text_threshold: float = 0.25,
+) -> dict | None:
+    """Run Grounded-DINO + SAM to localise *text_query* in *image*.
+
+    Returns a detection dict ``{"box": [x1,y1,x2,y2], "mask": np.ndarray|None,
+    "score": float}`` for the highest-confidence detection, or *None* when the
+    library is unavailable or no object is found above threshold.
+
+    The function is intentionally lenient — any import error or runtime error
+    causes a graceful *None* return so the pipeline degrades to the heuristic
+    fallback.
+    """
+    try:
+        import numpy as np
+        # Try Grounded-SAM 2 / groundingdino package
+        from groundingdino.util.inference import load_model, predict, annotate  # type: ignore
+        import groundingdino.datasets.transforms as T  # type: ignore
+        import torchvision  # type: ignore
+    except ImportError:
+        try:
+            # Fallback: try the older grounded_sam package layout
+            from groundingdino.util.inference import load_model, predict  # type: ignore
+        except ImportError:
+            # Neither package available — skip detection silently
+            return None
+
+    try:
+        import torch
+        from torchvision.ops import box_convert  # type: ignore
+
+        # Lazy-init: cache the model on first call to avoid repeated loads
+        if not hasattr(_detect_object, "_gdino_model"):
+            import os, glob
+            # Search for a Grounding DINO config and checkpoint in common locations
+            cfg_candidates = glob.glob(
+                os.path.join(os.path.dirname(__file__), "..", "**", "groundingdino_swint_ogc.py"),
+                recursive=True,
+            )
+            ckpt_candidates = glob.glob(
+                os.path.join(os.path.dirname(__file__), "..", "**", "groundingdino_swint_ogc.pth"),
+                recursive=True,
+            )
+            if not cfg_candidates or not ckpt_candidates:
+                # Config / checkpoint not found — skip detection
+                _detect_object._gdino_model = None  # type: ignore[attr-defined]
+            else:
+                _detect_object._gdino_model = load_model(  # type: ignore[attr-defined]
+                    cfg_candidates[0], ckpt_candidates[0]
+                )
+
+        model = _detect_object._gdino_model  # type: ignore[attr-defined]
+        if model is None:
+            return None
+
+        # Prepare image tensor
+        import torchvision.transforms as TVT
+        transform = TVT.Compose([
+            TVT.Resize((800, 1333)),
+            TVT.ToTensor(),
+            TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        img_tensor = transform(image).unsqueeze(0)
+
+        W_orig, H_orig = image.size
+
+        boxes, logits, _ = predict(
+            model=model,
+            image=img_tensor,
+            caption=text_query,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+        )
+
+        if len(boxes) == 0:
+            return None
+
+        # boxes are in [cx, cy, w, h] normalised; convert to [x1,y1,x2,y2] pixels
+        best_idx = int(logits.argmax())
+        box_norm = boxes[best_idx]  # [4]
+        box_xyxy = box_convert(box_norm.unsqueeze(0), in_fmt="cxcywh", out_fmt="xyxy")[0]
+        x1 = float(box_xyxy[0]) * W_orig
+        y1 = float(box_xyxy[1]) * H_orig
+        x2 = float(box_xyxy[2]) * W_orig
+        y2 = float(box_xyxy[3]) * H_orig
+
+        return {
+            "box":   [x1, y1, x2, y2],
+            "mask":  None,               # SAM mask integration can be added later
+            "score": float(logits[best_idx]),
+        }
+
+    except Exception as exc:
+        # Any runtime error → degrade gracefully
+        print(f"[Editor] Detection failed ({exc}); falling back to heuristic ROI.")
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,191 @@
 # Distortion-aware Dual-LoRA Fusion for Panorama-consistent Scene Editing
 
+---
+
+## Project Overview
+
+### Background and Motivation
+
+360° panoramic images in Equirectangular Projection (ERP) format are increasingly used in virtual classrooms, immersive training scenarios, and educational VR environments. Editing these panoramas with natural-language instructions poses two fundamental challenges that standard image-editing models (trained on perspective photographs) fail to address:
+
+1. **Geometric distortion**: ERP maps a sphere onto a flat canvas, introducing severe latitude-dependent stretching near the poles. Any content synthesised without awareness of this projection will appear warped or inconsistent when viewed as a spherical scene.
+2. **Pedagogical semantic constraints**: Educational scenes contain hierarchical object relationships (teacher, whiteboard, instruments, students, …) that must be preserved or respected when an edit request alters part of the scene. Ignoring these relations breaks the pedagogical intent.
+
+This project introduces a **parameter-efficient dual-branch LoRA adaptation** of the frozen **Qwen-Image-Edit-2511** vision-language model that simultaneously handles both challenges — without any paired before/after editing supervision.
+
+---
+
+### System Architecture
+
+```
+User instruction + ERP panorama
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Scene Understanding                        │
+│                                                                  │
+│  ┌───────────────────┐        ┌──────────────────────────────┐  │
+│  │  SceneGraph        │        │  ROI Localization             │  │
+│  │  (Qwen-max LLM)   │        │  (Grounded-SAM / fallback)   │  │
+│  │  scene_graph/      │        │  panorama_editing/roi/        │  │
+│  └────────┬──────────┘        └──────────────┬───────────────┘  │
+│           │ AESG JSON                         │ bounding box     │
+└───────────┼───────────────────────────────────┼─────────────────┘
+            ▼                                   ▼
+┌────────────────────────┐       ┌──────────────────────────────┐
+│  AESG Encoder          │       │  ERP Projection Parameters   │
+│  aesg/encoder.py       │       │  (lat, lon, FoV, centre)     │
+│  → z_G ∈ ℝ⁵¹²         │       │  lora/distortion_encoder.py  │
+└──────────┬─────────────┘       │  → z_θ ∈ ℝ⁵¹²               │
+           │                     └──────────────┬───────────────┘
+           └──────────────┬──────────────────────┘
+                          ▼
+              ┌──────────────────────┐
+              │  Adaptive Gating     │
+              │  lora/gating.py      │
+              │  [γ_p, γ_s] = σ(MLP │
+              │   ([z_θ; z_G; e_t]))│
+              └──────────┬───────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│              Dual-LoRA Modulated Backbone                       │
+│                                                                  │
+│   Frozen Qwen-Image-Edit-2511 cross-attention layers           │
+│                                                                  │
+│   W' = W + γ_p · ΔW_pano(z_θ) + γ_s · ΔW_aesg(z_G)          │
+│                                                                  │
+│   ┌──────────────────┐   ┌──────────────────┐                  │
+│   │  LoRA-Pano       │   │  LoRA-AESG       │                  │
+│   │  FiLM(z_θ) → A  │   │  FiLM(z_G) → A  │                  │
+│   │  lora/lora_pano  │   │  lora/lora_aesg  │                  │
+│   └──────────────────┘   └──────────────────┘                  │
+│                                                                  │
+│   HCFM: AESG branch tokens prepended to text cross-attn        │
+│   modules/hcfm.py                                               │
+└───────────────────────────────┬────────────────────────────────┘
+                                │ edited perspective patch
+                                ▼
+                   ┌────────────────────────┐
+                   │  ERP Reprojection      │
+                   │  panorama_editing/     │
+                   │  reproject.py          │
+                   └────────────────────────┘
+                                │
+                                ▼
+                    Output ERP panorama (edited)
+```
+
+---
+
+### Module Breakdown
+
+| Module | Location | Responsibility |
+|--------|----------|----------------|
+| **Dual-LoRA core** | `lora/` | All LoRA parameter modules: distortion encoder, FiLM conditioning, conditional LoRA layer, LoRA-Pano, LoRA-AESG, adaptive gating, fusion orchestrator |
+| **AESG schema & encoder** | `aesg/` | Typed dataclass schema for the Anchor-centred Educational Scene Graph; GNN-style token encoder that maps graph nodes/edges → z_G |
+| **Scene graph parser** | `scene_graph/` | LangChain + Qwen-max LLM wrapper that converts a free-text editing instruction into a structured AESG JSON, incorporating Physical Affiliation Analysis (PAA) and SE360 spatial reasoning |
+| **ERP data utilities** | `data/` | Sphere ↔ perspective projection helpers (ERP ↔ gnomonic), mask dilation, self-supervised degradation pipeline, PyTorch Dataset |
+| **Panorama editing pipeline** | `panorama_editing/` | Qwen-Image-Edit-2511 pipeline wrapper (`qwen_image_editing/`), ERP reprojection back to full panorama, ROI localisation via Grounded-SAM |
+| **HCFM fusion module** | `modules/hcfm.py` | Hierarchical Condition Fusion: prepends AESG branch tokens (anchor / object / context / relation) to the text hidden states feeding cross-attention |
+| **Training** | `training/` | Two-stage trainers with full loss suite (MSE + VGG perceptual + SSIM + panorama reprojection + AESG semantic losses) |
+| **Inference** | `inference/` | `PanoramaEditorWithLoRA` — 8-step end-to-end pipeline with CLI; saves intermediate crops and gate-value meta JSON |
+| **Panorama generation** | `panorama_generation/` | Separate Flux-based diffusion pipeline (CLIP + T5 + VAE + FluxTransformer2D) for unconditional 360° panorama synthesis |
+| **Configs** | `configs/` | YAML configuration for branch flags, loss weights, ROI thresholds, and FoV defaults |
+| **Tests** | `tests/` | End-to-end smoke tests for the AESG pipeline |
+
+---
+
+### Technology Stack
+
+| Layer | Tools / Models |
+|-------|---------------|
+| **Editing backbone** | Qwen-Image-Edit-2511 (7 B VLM, fully frozen during LoRA training) |
+| **Scene understanding LLM** | Qwen-max via LangChain + OpenAI-compatible API |
+| **Panorama generation** | Flux diffusion pipeline (FluxTransformer2D, CLIP, T5, VAE) via Diffusers |
+| **Object detection / ROI** | Grounded-SAM (GroundingDINO + SAM) |
+| **LoRA conditioning** | FiLM (Feature-wise Linear Modulation) |
+| **Perceptual loss** | VGG-16 (relu1\_2, relu2\_2, relu3\_3) |
+| **Image quality metrics** | SSIM (differentiable), LPIPS, FID, CLIP Score |
+| **Deep learning framework** | PyTorch 2.x |
+| **Configuration** | YAML (`configs/aesg_edit.yaml`) |
+| **Environment** | Conda `panorama`; single NVIDIA A100 40 GB sufficient |
+
+---
+
+### Complete End-to-End Workflow
+
+```
+Step 1  User provides:
+        • panorama.jpg  (2048×1024 ERP image)
+        • Editing prompt, e.g. "Replace the bench with a modern lab workstation"
+
+Step 2  Scene Graph Parser  (scene_graph/scene_graph.py)
+        • Qwen-max LLM parses the prompt via LangChain
+        • Outputs structured AESG JSON with core/context objects, spatial
+          relations, PAA affiliations, and safety constraints
+
+Step 3  AESG Encoding  (aesg/schema.py + aesg/encoder.py)
+        • JSON → typed AESGGraph dataclass (validated)
+        • Graph encoder maps nodes + edges → z_G ∈ ℝ⁵¹²
+
+Step 4  ROI Localisation  (panorama_editing/roi/roi_localization.py)
+        • Subject noun extracted from prompt by regex
+        • Grounded-SAM detects and segments the noun in the ERP image
+        • Detected box projected to perspective crop parameters (lat, lon, FoV)
+        • Fallback: centre-strip crop if SAM checkpoints unavailable
+
+Step 5  Distortion Encoding  (lora/distortion_encoder.py)
+        • Projection parameters (lat, lon, FoV, cx, cy) → sinusoidal MLP
+        • Outputs z_θ ∈ ℝ⁵¹²
+
+Step 6  Adaptive Gating  (lora/gating.py)
+        • MLP([z_θ; z_G; e_task]) → (γ_p, γ_s) ∈ [0,1]²
+        • γ_p weights the geometric LoRA-Pano branch
+        • γ_s weights the semantic LoRA-AESG branch
+
+Step 7  Dual-LoRA Priming  (lora/dual_lora_fusion.py)
+        • All DualLoRAFusion layers cached with z_θ, z_G, γ_p, γ_s via prime()
+        • Each cross-attention linear layer computes:
+          W'x = Wx + γ_p·ΔW_pano(z_θ)x + γ_s·ΔW_aesg(z_G)x
+
+Step 8  HCFM Token Injection  (modules/hcfm.py)
+        • AESG branch tokens (anchor / object / context / relation) are
+          concatenated to text hidden states before cross-attention
+
+Step 9  Backbone Editing  (panorama_editing/executor.py)
+        • QwenImageEditPlusPipeline runs on the perspective crop
+        • Backbone weights stay frozen; only LoRA deltas modify outputs
+
+Step 10 ERP Reprojection  (panorama_editing/reproject.py)
+        • Edited perspective patch re-blended into the original ERP panorama
+        • Seam blending applied at left/right boundary (λ_seam loss during training)
+
+Step 11 Output saved:
+        • output_edited.jpg            — full ERP panorama (edited)
+        • output_edited_meta.json      — γ_p, γ_s, projection params, detected box
+        • output_edited_perspective.jpg — original crop (with --save_intermediates)
+        • output_edited_edited_persp.jpg — edited crop before reprojection
+```
+
+---
+
+### Training Paradigm Summary
+
+This project uses **self-supervised reconstruction** — no paired editing data is required:
+
+1. Grounded-SAM detects objects in each training panorama → `*_mask.jpg`.
+2. A region is masked / degraded (grey fill, Gaussian noise, or heavy blur).
+3. The model learns to reconstruct the original from the degraded input.
+4. The reconstruction target is a real ERP panorama, so the model inherently learns geometry-consistent generation.
+
+Two training stages are applied sequentially:
+
+- **Stage 1**: trains only LoRA-Pano + distortion encoder (geometric adaptation).
+- **Stage 2**: jointly fine-tunes LoRA-AESG + gating network, while LoRA-Pano continues at 1/10 of the base learning rate.
+
+---
+
 A parameter-efficient adaptation strategy for editing 360° panoramic images (ERP format) using two complementary LoRA branches injected into the cross-attention layers of **Qwen-Image-Edit-2511**:
 
 - **LoRA-Pano** — encodes panoramic geometric priors (latitude-dependent distortion, FoV, projection centre) so edited content is geometrically consistent with ERP space.
@@ -112,7 +298,8 @@ conda activate panorama
 Trains the distortion encoder and LoRA-Pano adapters via self-supervised reconstruction.
 
 ```bash
-conda run -n panorama python -m training.train_stage1 \
+conda activate panorama 
+python -m training.train_stage1 \
     --data_root /users/2522553y/liangyue_ws/vlm_panorama/data \
     --output_dir ./checkpoints/stage1 \
     --epochs 30 \
@@ -143,7 +330,8 @@ conda run -n panorama python -u -m training.train_stage2 \
     --data_root /users/2522553y/liangyue_ws/vlm_panorama/data \
     --stage1_ckpt ./checkpoints/stage1/best_checkpoint.pt \
     --output_dir ./checkpoints/stage2 \
-    --epochs 30
+    --epochs 30 \
+    --batch_size 4
 ```
 
 Additional Stage 2 arguments:
@@ -168,9 +356,9 @@ Grounded-SAM to locate and mask the region. If Grounded-SAM checkpoints are
 not available it falls back to a centre-strip crop.
 
 ```bash
-conda run -n panorama python -m inference.edit_with_lora \
-    --input  data/train/scene_000/panorama.jpg \
-    --prompt "Replace the bench with a modern lab workstation" \
+python -m inference.edit_with_lora \
+    --input  /users/2522553y/liangyue_ws/panorama_test/desk/result.png \
+    --prompt "请将桌子材质替换为铝合金材质" \
     --stage2_ckpt ./checkpoints/stage2/best_checkpoint.pt \
     --output output_edited.jpg \
     --save_intermediates

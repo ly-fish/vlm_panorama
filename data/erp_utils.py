@@ -88,7 +88,8 @@ def erp_to_perspective(
     u_map = (lon_map / (2 * math.pi) + 0.5) * W_erp   # [0, W_erp]
     v_map = (0.5 - lat_map / math.pi) * H_erp          # [0, H_erp]
 
-    u_map = np.clip(u_map, 0, W_erp - 1).astype(np.float32)
+    # Use modular wrapping for longitude (handles objects crossing the ±180° seam)
+    u_map = (u_map % W_erp).astype(np.float32)
     v_map = np.clip(v_map, 0, H_erp - 1).astype(np.float32)
 
     # Bilinear sampling
@@ -103,7 +104,11 @@ def project_mask_to_perspective(
     erp_mask: np.ndarray,
     sample_map: np.ndarray,
 ) -> np.ndarray:
-    """Project an ERP binary mask to perspective view using the sample map.
+    """Project an ERP binary mask to perspective view using bilinear interpolation.
+
+    Bilinear interpolation avoids the ragged boundaries that nearest-neighbour
+    produces at high latitudes where ERP pixels are strongly stretched.  The
+    result is thresholded at 127 to keep the output binary.
 
     Args:
         erp_mask:   [H_erp, W_erp] uint8 binary mask (0 or 255).
@@ -112,12 +117,122 @@ def project_mask_to_perspective(
     Returns:
         Perspective binary mask [H_p, W_p] uint8.
     """
-    u_map = sample_map[..., 0].astype(np.int32)
-    v_map = sample_map[..., 1].astype(np.int32)
     H_erp, W_erp = erp_mask.shape[:2]
-    u_map = np.clip(u_map, 0, W_erp - 1)
-    v_map = np.clip(v_map, 0, H_erp - 1)
-    return erp_mask[v_map, u_map]
+    mask_f = erp_mask.astype(np.float32)
+
+    u = sample_map[..., 0]   # fractional ERP x
+    v = sample_map[..., 1]   # fractional ERP y
+
+    # Bilinear neighbours (with modular wrapping on u for the seam)
+    u0 = np.floor(u).astype(np.int32) % W_erp
+    u1 = (u0 + 1) % W_erp
+    v0 = np.clip(np.floor(v).astype(np.int32), 0, H_erp - 1)
+    v1 = np.clip(v0 + 1, 0, H_erp - 1)
+
+    du = (u - np.floor(u))[..., np.newaxis]   # [H_p, W_p, 1]
+    dv = (v - np.floor(v))[..., np.newaxis]
+
+    top    = mask_f[v0, u0, np.newaxis] * (1 - du) + mask_f[v0, u1, np.newaxis] * du
+    bottom = mask_f[v1, u0, np.newaxis] * (1 - du) + mask_f[v1, u1, np.newaxis] * du
+    interp = (top * (1 - dv) + bottom * dv)[..., 0]   # [H_p, W_p]
+
+    return (interp >= 127).astype(np.uint8) * 255
+
+
+def _compute_perspective_grid(
+    lat_deg: float,
+    lon_deg: float,
+    fov_deg: float,
+    persp_w: int,
+    persp_h: int,
+    erp_h: int,
+    erp_w: int,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """Compute per-ERP-pixel perspective-image coordinates (inverse of erp_to_perspective).
+
+    For each ERP pixel (u, v) this function returns the perspective-patch pixel
+    coordinates (map_x, map_y) that the ERP pixel corresponds to.  This is the
+    analytical inverse of the forward projection used in ``erp_to_perspective``
+    and enables hole-free ``cv2.remap``-based reprojection.
+
+    The forward projection is::
+
+        world = R_y(lon_c) @ R_x(lat_c) @ camera_ray
+
+    The inverse is therefore::
+
+        camera_ray = R_x(lat_c)^T @ R_y(lon_c)^T @ world
+
+    Args:
+        lat_deg, lon_deg: Viewing-direction centre in degrees.
+        fov_deg:          Horizontal field-of-view in degrees.
+        persp_w, persp_h: Perspective patch size in pixels.
+        erp_h, erp_w:     ERP image size in pixels.
+
+    Returns:
+        map_x: [H_erp, W_erp] float32 — perspective x-coord for each ERP pixel.
+        map_y: [H_erp, W_erp] float32 — perspective y-coord for each ERP pixel.
+        valid: [H_erp, W_erp] bool    — True where the ERP pixel is inside the
+               camera frustum and within the perspective image bounds.
+    """
+    lat_c = math.radians(lat_deg)
+    lon_c = math.radians(lon_deg)
+    fov_r = math.radians(fov_deg)
+    f = (persp_w / 2.0) / math.tan(fov_r / 2.0)
+
+    # Full ERP pixel grid
+    u = np.arange(erp_w, dtype=np.float64)
+    v = np.arange(erp_h, dtype=np.float64)
+    uu, vv = np.meshgrid(u, v)   # [H_erp, W_erp]
+
+    # ERP pixel → spherical angles (same formula as erp_to_perspective)
+    lon_map = (uu / erp_w - 0.5) * (2.0 * math.pi)   # [-π, π]
+    lat_map = (0.5 - vv / erp_h) * math.pi             # [-π/2, π/2]
+
+    # Spherical → world unit vectors
+    cos_lat_m = np.cos(lat_map)
+    xr = cos_lat_m * np.sin(lon_map)
+    yr = np.sin(lat_map)
+    zr = cos_lat_m * np.cos(lon_map)
+
+    # Inverse rotation: camera = R_x(lat_c)^T @ R_y(lon_c)^T @ world
+    #
+    # R_y(lon_c) = [[cos_lon,0,sin_lon],[0,1,0],[-sin_lon,0,cos_lon]]
+    # R_y(lon_c)^T= [[cos_lon,0,-sin_lon],[0,1,0],[sin_lon,0,cos_lon]]
+    cos_lon, sin_lon = math.cos(lon_c), math.sin(lon_c)
+    x_p =  xr * cos_lon - zr * sin_lon
+    y_p =  yr
+    z_p =  xr * sin_lon + zr * cos_lon
+
+    # R_x(lat_c) = [[1,0,0],[0,cos_lat,-sin_lat],[0,sin_lat,cos_lat]]
+    # R_x(lat_c)^T= [[1,0,0],[0,cos_lat,sin_lat],[0,-sin_lat,cos_lat]]
+    cos_lat, sin_lat = math.cos(lat_c), math.sin(lat_c)
+    xv =  x_p
+    yv =  y_p * cos_lat + z_p * sin_lat
+    zv = -y_p * sin_lat + z_p * cos_lat
+
+    # Only pixels in front of the camera (zv > 0) are visible
+    valid = zv > 1e-6
+
+    # Project to perspective pixel coordinates
+    # erp_to_perspective: xs = (j - W_p/2 + 0.5) / f  →  j = xs*f + W_p/2 - 0.5
+    safe_zv = np.where(valid, zv, 1.0)   # avoid division by zero
+    map_x = (xv / safe_zv * f + persp_w / 2.0 - 0.5).astype(np.float32)
+    map_y = (yv / safe_zv * f + persp_h / 2.0 - 0.5).astype(np.float32)
+
+    # Discard pixels projecting outside the perspective image boundaries
+    in_bounds = (
+        (map_x >= 0) & (map_x < persp_w - 1) &
+        (map_y >= 0) & (map_y < persp_h - 1)
+    )
+    valid = valid & in_bounds
+
+    # cv2.remap fills pixels with borderValue when map coords are out-of-bounds;
+    # set invalid entries to -1 to trigger that fill path.
+    map_x = np.where(valid, map_x, np.float32(-1.0))
+    map_y = np.where(valid, map_y, np.float32(-1.0))
+
+    return map_x, map_y, valid
 
 
 def reproject_perspective_to_erp(
@@ -126,15 +241,36 @@ def reproject_perspective_to_erp(
     sample_map: np.ndarray,
     erp_mask: np.ndarray,
     feather_px: int = 8,
+    proj_params: "Any | None" = None,
+    persp_mask: "np.ndarray | None" = None,
 ) -> np.ndarray:
     """Blend an edited perspective patch back into an ERP image.
+
+    Two code paths are available:
+
+    * **Inverse-mapping path** (preferred, activated when *proj_params* is
+      supplied): computes the analytical inverse of ``erp_to_perspective`` for
+      every ERP pixel and samples the edited patch with ``cv2.remap``.
+      Geometrically exact — no scatter holes at high latitudes.
+
+    * **Forward-scatter fallback** (used when *proj_params* is ``None``): the
+      original implementation that scatters perspective pixels back to ERP
+      positions.  Kept for backward compatibility.
 
     Args:
         erp_base:    [H, W, 3] original ERP image.
         persp_patch: [H_p, W_p, 3] edited perspective patch.
         sample_map:  [H_p, W_p, 2] (u, v) ERP coordinates (from erp_to_perspective).
         erp_mask:    [H, W] binary mask (255 = edited region) in ERP space.
-        feather_px:  Gaussian feather radius for blending.
+                     Used only by the forward-scatter fallback.
+        feather_px:  Gaussian feather radius for boundary blending.
+        proj_params: Optional object with ``.lat``, ``.lon``, ``.fov`` attributes
+                     (a :class:`~lora.distortion_encoder.ProjectionParams` instance).
+                     Activates the hole-free inverse-mapping path when provided.
+        persp_mask:  [H_p, W_p] uint8 binary mask of the object region in
+                     perspective space.  Used by the inverse path to build a
+                     hole-free ERP blend mask.  Falls back to the full camera
+                     frustum when ``None``.
 
     Returns:
         Blended ERP image [H, W, 3] uint8.
@@ -142,21 +278,66 @@ def reproject_perspective_to_erp(
     import cv2
 
     H_erp, W_erp = erp_base.shape[:2]
+    H_p, W_p = persp_patch.shape[:2]
+
+    if proj_params is not None:
+        # ------------------------------------------------------------------
+        # Inverse-mapping path: analytically project ERP pixels into the
+        # perspective patch and sample with cv2.remap.  No scatter holes.
+        # ------------------------------------------------------------------
+        map_x, map_y, visible = _compute_perspective_grid(
+            proj_params.lat, proj_params.lon, proj_params.fov,
+            W_p, H_p, H_erp, W_erp,
+        )
+
+        # Remap the edited patch content into ERP space
+        reprojected = cv2.remap(
+            persp_patch.astype(np.float32),
+            map_x, map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )   # [H_erp, W_erp, 3]
+
+        # Build a hole-free ERP blend mask by remapping the perspective mask
+        if persp_mask is not None:
+            mask_remapped = cv2.remap(
+                persp_mask.astype(np.float32),
+                map_x, map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )   # [H_erp, W_erp]
+            blend_mask = ((mask_remapped > 127) & visible).astype(np.float32)
+        else:
+            blend_mask = visible.astype(np.float32)
+
+        # Feather the boundary and composite
+        if feather_px > 0:
+            blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), feather_px)
+        blend_mask_3d = blend_mask[..., np.newaxis]
+        result = erp_base.copy().astype(np.float32)
+        blended = reprojected * blend_mask_3d + result * (1.0 - blend_mask_3d)
+        blended = _smooth_horizontal_seam(blended)
+        return blended.clip(0, 255).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # Forward-scatter fallback (original implementation)
+    # ------------------------------------------------------------------
     result = erp_base.copy().astype(np.float32)
 
-    # For each perspective pixel, scatter into ERP if inside the mask
-    H_p, W_p = sample_map.shape[:2]
-    u_map = sample_map[..., 0].astype(np.int32)
-    v_map = sample_map[..., 1].astype(np.int32)
+    u_idx = np.clip(sample_map[..., 0].astype(np.int32), 0, W_erp - 1)  # [H_p,W_p]
+    v_idx = np.clip(sample_map[..., 1].astype(np.int32), 0, H_erp - 1)
 
     patch_f = persp_patch.astype(np.float32)
-    for py in range(H_p):
-        for px in range(W_p):
-            eu, ev = int(u_map[py, px]), int(v_map[py, px])
-            if 0 <= eu < W_erp and 0 <= ev < H_erp and erp_mask[ev, eu] > 0:
-                result[ev, eu] = patch_f[py, px]
 
-    # Feather the boundary
+    # Only scatter pixels covered by erp_mask (avoids overwriting background)
+    covered = erp_mask[v_idx, u_idx] > 0                    # [H_p, W_p] bool
+    flat_v  = v_idx[covered]
+    flat_u  = u_idx[covered]
+    result[flat_v, flat_u] = patch_f.reshape(-1, 3)[covered.ravel()]
+
+    # Feather the boundary using the ERP-space mask
     mask_f = erp_mask.astype(np.float32) / 255.0
     if feather_px > 0:
         mask_f = cv2.GaussianBlur(mask_f, (0, 0), feather_px)

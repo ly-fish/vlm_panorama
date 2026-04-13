@@ -212,8 +212,8 @@ def edit_panorama(
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
     # input_path = os.path.join(base_dir, "input_image", "robot_dog.png")
-    input_path = r"/users/2522553y/liangyue_ws/qwen_image/input_image/robot_dog.png"
-    prompt = "这是一张360° ERP全景图，请在机器狗的左边增加一个绿色方凳子"
+    input_path = r"/users/2522553y/liangyue_ws/qwen_image/input_image/painting.png"
+    prompt = "这是一张360° ERP全景图，请增加一个桌子"
     use_aesg = True
     
     suffix = "_aesg" if use_aesg else ""
