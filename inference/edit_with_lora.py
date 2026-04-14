@@ -263,23 +263,34 @@ class PanoramaEditorWithLoRA:
         # ------------------------------------------------------------------
         # Call Qwen pipeline with LoRA conditions primed in every fusion layer
         # ------------------------------------------------------------------
-        gen = torch.Generator(device=self.device).manual_seed(42)
-
-        # When no valid LoRA weights, skip priming (identity delta)
-        ctx = (
-            _primed_lora(self.fusion_layers, z_theta, z_G, gamma_p, gamma_s)
-            if self._has_lora
-            else _noop_ctx()
-        )
+        gen = torch.Generator(device=self.device).manual_seed(0)
 
         local_img  = roi_result["local_image"]
         confidence = float(roi_result["projection_meta"].get("confidence", 0.0))
-        # When a real detection is available the strategy is "detection_perspective"
-        # and confidence is already clamped to ≥ 0.7 in roi_localization.  For the
-        # heuristic fallback (confidence=0.2) we skip local editing and fall back to
-        # full-panorama editing — matching the original executor behaviour.
+        strategy   = roi_result["projection_meta"].get("strategy", "heuristic_crop")
         threshold  = float(config.get("roi_confidence_threshold", 0.7))
-        use_local  = confidence >= threshold
+        # Only do local patch editing when we have a *real* detection or an
+        # explicit roi_hint.  The heuristic fallback ("heuristic_crop") relies
+        # on keyword-inferred angles that are too imprecise to crop the correct
+        # area — editing a wrongly-cropped patch (e.g. steps instead of a
+        # walkway) and reprojecting it back produces worse results than editing
+        # the full panorama directly.
+        use_local  = (
+            confidence >= threshold
+            and strategy in ("detection_perspective", "hint_perspective")
+        )
+
+        # Prime LoRA conditioning only when doing local patch editing.
+        # The LoRA adapters were trained exclusively on perspective patches, so
+        # applying them to a full ERP edit introduces a spatial bias (z_theta
+        # from the ROI leaks into the full-panorama generation) that degrades
+        # object placement.  When falling back to full-panorama editing we
+        # behave identically to the baseline executor.
+        ctx = (
+            _primed_lora(self.fusion_layers, z_theta, z_G, gamma_p, gamma_s)
+            if (self._has_lora and use_local)
+            else _noop_ctx()
+        )
 
         with ctx:
             if use_local:

@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
 
 
 _PIPELINE: QwenImageEditPlusPipeline | None = None
+_PIPELINE_DEVICE: str | None = None
 
 
 def load_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -57,17 +58,19 @@ def load_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     return defaults
 
 
-def get_pipeline() -> QwenImageEditPlusPipeline:
-    global _PIPELINE
-    if _PIPELINE is None:
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+def get_pipeline(device: str | None = None) -> QwenImageEditPlusPipeline:
+    global _PIPELINE, _PIPELINE_DEVICE
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if _PIPELINE is None or _PIPELINE_DEVICE != device:
+        dtype = torch.bfloat16 if "cuda" in device else torch.float32
         _PIPELINE = QwenImageEditPlusPipeline.from_pretrained(
             "Qwen/Qwen-Image-Edit-2511",
             torch_dtype=dtype,
         )
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         _PIPELINE.to(device)
         _PIPELINE.set_progress_bar_config(disable=None)
+        _PIPELINE_DEVICE = device
     return _PIPELINE
 
 
@@ -77,9 +80,10 @@ def _run_qwen_edit(
     *,
     aesg_condition: dict[str, Any] | None = None,
     aesg_config: dict[str, Any] | None = None,
+    device: str | None = None,
 ) -> Image.Image:
-    pipeline = get_pipeline()
-    generator_device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipeline = get_pipeline(device=device)
+    generator_device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     output = pipeline(
         image=[image],
         prompt=text,
@@ -99,9 +103,10 @@ def edit_panorama_without_aesg(
     image_erp: str | Image.Image,
     text: str,
     return_intermediates: bool = False,
+    device: str | None = None,
 ) -> Image.Image | dict[str, Any]:
     image = Image.open(image_erp).convert("RGB") if isinstance(image_erp, str) else image_erp.convert("RGB")
-    edited_image = _run_qwen_edit(image=image, text=text, aesg_condition=None, aesg_config=None)
+    edited_image = _run_qwen_edit(image=image, text=text, aesg_condition=None, aesg_config=None, device=device)
 
     if not return_intermediates:
         return edited_image
@@ -120,6 +125,7 @@ def edit_panorama_with_aesg(
     aesg_json: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
     return_intermediates: bool = False,
+    device: str | None = None,
 ) -> Image.Image | dict[str, Any]:
     config = load_config(config)
     image = Image.open(image_erp).convert("RGB") if isinstance(image_erp, str) else image_erp.convert("RGB")
@@ -155,6 +161,7 @@ def edit_panorama_with_aesg(
             text=effective_prompt,
             aesg_condition=condition_tokens,
             aesg_config=config,
+            device=device,
         )
         final_image = reproject_to_erp(image, edited_local, roi_result)
     else:
@@ -164,6 +171,7 @@ def edit_panorama_with_aesg(
             text=effective_prompt,
             aesg_condition=condition_tokens,
             aesg_config=config,
+            device=device,
         )
 
     if not return_intermediates:
@@ -193,6 +201,7 @@ def edit_panorama(
     aesg_json: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
     return_intermediates: bool = False,
+    device: str | None = None,
 ) -> Image.Image | dict[str, Any]:
     """Edit a panoramic image.
 
@@ -202,6 +211,10 @@ def edit_panorama(
     Qwen model.  This is preferred over the plain baseline whenever a trained
     checkpoint is available because it produces visibly better ERP-consistent
     results.
+
+    Args:
+        device: CUDA device string (e.g. ``"cuda:0"``, ``"cuda:1"``, ``"cpu"``).
+                When *None* the device is auto-detected.
     """
     if lora_ckpt is not None:
         import sys
@@ -214,6 +227,7 @@ def edit_panorama(
         editor = PanoramaEditorWithLoRA(
             stage2_ckpt=lora_ckpt,
             lora_rank=lora_rank,
+            device=device or "auto",
         )
         result = editor.edit(
             panorama=image_erp,
@@ -237,11 +251,13 @@ def edit_panorama(
             aesg_json=aesg_json,
             config=config,
             return_intermediates=return_intermediates,
+            device=device,
         )
     return edit_panorama_without_aesg(
         image_erp=image_erp,
         text=text,
         return_intermediates=return_intermediates,
+        device=device,
     )
 
 

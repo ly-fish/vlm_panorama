@@ -219,7 +219,11 @@ def _from_heuristic(
     crop_h = max(64, min(H_erp, int(H_erp * roi_height_ratio)))
 
     theta, phi = _infer_angles_from_graph(aesg_graph)
-    confidence = 0.75 if _has_explicit_localization(aesg_graph) else 0.2
+    # Heuristic ROI is inherently unreliable for spatial placement — always
+    # keep confidence below the local-editing threshold (0.7) so the caller
+    # falls back to full-panorama editing rather than using a guess-based crop
+    # that might land on the wrong area (e.g. steps instead of a walkway).
+    confidence = 0.2
 
     center_x = int(((theta + math.pi) / (2 * math.pi)) * W_erp) % W_erp
     center_y = int(((math.pi / 2 - phi) / math.pi) * H_erp)

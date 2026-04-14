@@ -466,8 +466,3 @@ Single A100 40 GB is sufficient for training.
 | Data scaling (50/100/150/200 scenes) | Data sufficiency |
 
 ---
-
-## Citation
-
-> Distortion-aware Dual-LoRA Fusion for Panorama-consistent Scene Editing.
-> Target journal: *Techniques and Applications of Multimodal Data Fusion*.
