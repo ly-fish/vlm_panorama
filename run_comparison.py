@@ -290,12 +290,33 @@ def main() -> None:
             args=args,
         )
 
+    # --- Promote LoRA output as primary result when available ---
+    # The LoRA model produces higher-quality ERP-consistent edits than the
+    # plain baseline.  When the LoRA branch ran successfully, copy its output
+    # to a canonical "result.png" so downstream tools always get the best output.
+    if run_lora_branch:
+        import shutil
+        lora_file = output_dir / f"{stem}_lora.png"
+        primary_result = output_dir / f"{stem}_result.png"
+        if lora_file.exists():
+            shutil.copy2(lora_file, primary_result)
+            print(f"[Runner] Primary result (LoRA) → {primary_result}")
+    elif run_base:
+        import shutil
+        baseline_file = output_dir / f"{stem}_baseline.png"
+        primary_result = output_dir / f"{stem}_result.png"
+        if baseline_file.exists():
+            shutil.copy2(baseline_file, primary_result)
+            print(f"[Runner] Primary result (baseline) → {primary_result}")
+
     # --- Summary ---
     print("\n[Runner] ========== DONE ==========")
     if run_base:
         print(f"  Baseline : {output_dir / f'{stem}_baseline.png'}")
     if run_lora_branch:
         print(f"  LoRA     : {output_dir / f'{stem}_lora.png'}")
+    if "primary_result" in dir():
+        print(f"  Primary  : {primary_result}")
     print("[Runner] ===================================\n")
 
 

@@ -362,6 +362,11 @@ python -m inference.edit_with_lora \
     --stage2_ckpt ./checkpoints/stage2/best_checkpoint.pt \
     --output output_edited.jpg \
     --save_intermediates
+
+
+    python run_comparison.py \
+    --input /users/2522553y/liangyue_ws/panorama_test/desk/result.png \
+    --prompt "请将桌子材质替换为铝合金材质"
 ```
 
 With `--save_intermediates` the script additionally saves:

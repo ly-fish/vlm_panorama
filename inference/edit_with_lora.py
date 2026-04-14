@@ -381,7 +381,8 @@ def _noop_ctx():
 def _degrade_local_patch(
     local_img: "Image.Image",
     mask: "Image.Image",
-    strategy: str = "gray",
+    strategy: str = "soft_blend",
+    degrade_alpha: float = 0.6,
 ) -> "Image.Image":
     """Apply the same degradation used during LoRA training to a local patch.
 
@@ -392,11 +393,19 @@ def _degrade_local_patch(
     correctly.
 
     Args:
-        local_img: PIL Image of the perspective patch (clean).
-        mask:      PIL Image (mode "L") marking the object region in patch
-                   coordinates (255 = object, 0 = background).
-        strategy:  ``"gray"`` | ``"noise"`` | ``"blur"`` | ``"random"``.
-                   Defaults to ``"gray"`` (most stable for inference).
+        local_img:     PIL Image of the perspective patch (clean).
+        mask:          PIL Image (mode "L") marking the object region in patch
+                       coordinates (255 = object, 0 = background).
+        strategy:      ``"soft_blend"`` | ``"gray"`` | ``"noise"`` |
+                       ``"blur"`` | ``"random"``.
+                       Defaults to ``"soft_blend"`` which preserves high-
+                       frequency texture (reflections, structure) better than
+                       the hard ``"gray"`` replacement used during training.
+        degrade_alpha: Blend weight for ``"soft_blend"`` strategy.
+                       0.0 = original unchanged, 1.0 = full gray.
+                       Defaults to 0.6 (keeps 40 % of original texture so
+                       the model still sees reflections / structure cues while
+                       the LoRA conditioning pathway activates correctly).
 
     Returns:
         Degraded PIL Image of the same size as ``local_img``.
@@ -405,27 +414,40 @@ def _degrade_local_patch(
     import random as _random
     from PIL import Image as _PILImage
 
-    img_arr  = np.array(local_img.convert("RGB"))
+    img_arr  = np.array(local_img.convert("RGB")).astype(np.float32)
     mask_arr = np.array(mask.convert("L"))
 
     obj_region = mask_arr > 0
 
     if strategy == "random":
-        strategy = _random.choice(["gray", "noise", "blur"])
+        strategy = _random.choice(["soft_blend", "noise", "blur"])
 
-    if strategy == "noise":
-        noise = np.random.normal(128, 40, img_arr.shape).clip(0, 255).astype(np.uint8)
+    if strategy == "soft_blend":
+        # Blend original pixels toward gray in the object region.
+        # Unlike hard "gray" this keeps partial texture / reflection
+        # information (high-frequency detail), preventing the model from
+        # having to reconstruct surface appearance entirely from scratch.
+        alpha = float(degrade_alpha)
+        gray = np.full_like(img_arr, 128.0)
+        img_arr[obj_region] = (
+            (1.0 - alpha) * img_arr[obj_region] + alpha * gray[obj_region]
+        )
+    elif strategy == "noise":
+        noise = np.random.normal(128, 40, img_arr.shape).clip(0, 255)
         img_arr[obj_region] = noise[obj_region]
     elif strategy == "blur":
         import cv2  # type: ignore
-        sigma = 40.0
+        # Use a moderate sigma (12) rather than 40 so structural edges and
+        # reflections are softened but not completely destroyed.
+        sigma = 12.0
         k = int(sigma * 3) | 1
-        blurred = cv2.GaussianBlur(img_arr, (k, k), sigma)
+        src = img_arr.astype(np.uint8)
+        blurred = cv2.GaussianBlur(src, (k, k), sigma).astype(np.float32)
         img_arr[obj_region] = blurred[obj_region]
-    else:  # "gray" (default)
-        img_arr[obj_region] = 128
+    else:  # "gray" — original hard replacement (kept for training compatibility)
+        img_arr[obj_region] = 128.0
 
-    return _PILImage.fromarray(img_arr)
+    return _PILImage.fromarray(img_arr.clip(0, 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------

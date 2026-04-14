@@ -186,12 +186,48 @@ def edit_panorama(
     text: str,
     *,
     use_aesg: bool = True,
+    lora_ckpt: str | None = None,
+    lora_rank: int = 8,
     dialogue: str | None = None,
     roi_hint: dict[str, Any] | None = None,
     aesg_json: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
     return_intermediates: bool = False,
 ) -> Image.Image | dict[str, Any]:
+    """Edit a panoramic image.
+
+    When *lora_ckpt* is provided the call is transparently routed through
+    :class:`~inference.edit_with_lora.PanoramaEditorWithLoRA`, which applies
+    the trained Dual-LoRA geometric + semantic conditioning on top of the base
+    Qwen model.  This is preferred over the plain baseline whenever a trained
+    checkpoint is available because it produces visibly better ERP-consistent
+    results.
+    """
+    if lora_ckpt is not None:
+        import sys
+        from pathlib import Path as _Path
+        # Ensure the package root is importable when called from external scripts
+        _pkg_root = str(_Path(__file__).resolve().parents[1])
+        if _pkg_root not in sys.path:
+            sys.path.insert(0, _pkg_root)
+        from inference.edit_with_lora import PanoramaEditorWithLoRA
+        editor = PanoramaEditorWithLoRA(
+            stage2_ckpt=lora_ckpt,
+            lora_rank=lora_rank,
+        )
+        result = editor.edit(
+            panorama=image_erp,
+            prompt=text,
+            save_intermediates=return_intermediates,
+        )
+        if return_intermediates:
+            # Normalise keys to match the baseline return format
+            return {
+                "final_image": result["edited_panorama"],
+                **{k: v for k, v in result.items() if k != "edited_panorama"},
+            }
+        return result["edited_panorama"]
+
     if use_aesg:
         return edit_panorama_with_aesg(
             image_erp=image_erp,

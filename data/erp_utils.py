@@ -318,7 +318,12 @@ def reproject_perspective_to_erp(
         blend_mask_3d = blend_mask[..., np.newaxis]
         result = erp_base.copy().astype(np.float32)
         blended = reprojected * blend_mask_3d + result * (1.0 - blend_mask_3d)
-        blended = _smooth_horizontal_seam(blended)
+        # Only smooth the horizontal seam when the edit region actually touches
+        # the ±180° seam columns; otherwise this would corrupt unrelated areas
+        # (e.g. the roof ridge) even when the edit is far from the seam.
+        seam_threshold = 0.05
+        if blend_mask[:, 0].max() > seam_threshold or blend_mask[:, -1].max() > seam_threshold:
+            blended = _smooth_horizontal_seam(blended)
         return blended.clip(0, 255).astype(np.uint8)
 
     # ------------------------------------------------------------------
@@ -344,8 +349,11 @@ def reproject_perspective_to_erp(
     mask_f = mask_f[..., np.newaxis]
     blended = result * mask_f + erp_base.astype(np.float32) * (1.0 - mask_f)
 
-    # Horizontal seam smoothing
-    blended = _smooth_horizontal_seam(blended)
+    # Only smooth the horizontal seam when the edit region actually touches it
+    seam_threshold = 0.05
+    raw_mask = erp_mask.astype(np.float32) / 255.0
+    if raw_mask[:, 0].max() > seam_threshold or raw_mask[:, -1].max() > seam_threshold:
+        blended = _smooth_horizontal_seam(blended)
     return blended.clip(0, 255).astype(np.uint8)
 
 
