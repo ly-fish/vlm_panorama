@@ -1,0 +1,188 @@
+[
+  {
+    "scene_id": "scene_00",
+    "object_label": "cardboard box stack",
+    "scene_description": "This is a panorama. A warehouse with one large cardboard box stack at the center, surrounded by pallets, labels, carts, shelves, and strong industrial lighting.",
+    "prompt": "将纸板箱堆替换为金属货架箱"
+  },
+  {
+    "scene_id": "scene_01",
+    "object_label": "toy box",
+    "scene_description": "This is a panorama. A child’s bedroom with one large blue toy box at the center, surrounded by stuffed animals, picture books, a rug, small chairs, and soft daylight.",
+    "prompt": "将蓝色玩具箱替换为木质玩具储物柜"
+  },
+  {
+    "scene_id": "scene_02",
+    "object_label": "mountain",
+    "scene_description": "This is a panorama. A traditional ink painting with one large mountain at the center, surrounded by mist and brush strokes.",
+    "prompt": "将水墨山峰替换为积雪覆盖的雪山"
+  },
+  {
+    "scene_id": "scene_03",
+    "object_label": "microscope",
+    "scene_description": "This is a panorama. A dining hall with one large buffet counter at the center, surrounded by trays, chairs, signs, serving tools, and warm overhead lighting.",
+    "prompt": "将显微镜替换为天文望远镜"
+  },
+  {
+    "scene_id": "scene_04",
+    "object_label": "mask",
+    "scene_description": "This is a panorama. A stylized artwork with one large mask at the center, surrounded by patterns and textures.",
+    "prompt": "将面具替换为金色金属面具"
+  },
+  {
+    "scene_id": "scene_05",
+    "object_label": "sunflowers",
+    "scene_description": "This is a panorama. A flower shop with one large bucket of sunflowers at the center, surrounded by wrapping paper, scissors, baskets, flower stands, and natural light.",
+    "prompt": "将向日葵替换为红色玫瑰花束"
+  },
+  {
+    "scene_id": "scene_06",
+    "object_label": "interactive screen",
+    "scene_description": "This is a panorama. A high-tech classroom focused on a giant transparent interactive screen in the center, with students seated around it, digital desks, white walls, and bright ceiling lights.",
+    "prompt": "将交互式大屏幕替换为传统黑板"
+  },
+  {
+    "scene_id": "scene_07",
+    "object_label": "cork board",
+    "scene_description": "This is a panorama. A design classroom with one large cork board at the center, surrounded by stools, sketch tables, posters, shelves, and soft lighting.",
+    "prompt": "将软木留言板替换为白色白板"
+  },
+  {
+    "scene_id": "scene_08",
+    "object_label": "waterfall",
+    "scene_description": "This is a panorama. A waterfall scene with one large waterfall at the center, surrounded by rocks, mist, trees, and flowing water.",
+    "prompt": "将瀑布替换为结冰的冰瀑"
+  },
+  {
+    "scene_id": "scene_09",
+    "object_label": "suitcase",
+    "scene_description": "This is a panorama. A travel lounge with one large suitcase at the center, surrounded by airport seats, charging stations, signs, glass walls, and terminal lighting.",
+    "prompt": "将行李箱替换为登山双肩背包"
+  },
+  {
+    "scene_id": "scene_10",
+    "object_label": "tractor",
+    "scene_description": "This is a panorama. A farm with one large tractor at the center, surrounded by barns, hay bales, fences, and open fields.",
+    "prompt": "将拖拉机替换为现代联合收割机"
+  },
+  {
+    "scene_id": "scene_11",
+    "object_label": "line object",
+    "scene_description": "This is a panorama. A minimal illustration with one large line object at the center, surrounded by empty background.",
+    "prompt": "将线条图形替换为螺旋曲线图形"
+  },
+  {
+    "scene_id": "scene_12",
+    "object_label": "oven",
+    "scene_description": "This is a panorama. A kitchen interior with one large black oven at the center, surrounded by countertops, cabinets, pans, utensils, and bright warm lights.",
+    "prompt": "将黑色烤箱替换为不锈钢微波炉"
+  },
+  {
+    "scene_id": "scene_13",
+    "object_label": "leaf",
+    "scene_description": "This is a panorama. A watercolor art piece with one large leaf at the center, surrounded by soft green gradients.",
+    "prompt": "将绿色树叶替换为秋天的红枫叶"
+  },
+  {
+    "scene_id": "scene_14",
+    "object_label": "reading tent",
+    "scene_description": "This is a panorama. A children's classroom centered around a giant colorful reading tent filled with pillows and books, surrounded by small desks, toys, drawings, and cheerful wall decorations.",
+    "prompt": "将阅读帐篷替换为带帷幕的阅读角落"
+  },
+  {
+    "scene_id": "scene_15",
+    "object_label": "floating clock",
+    "scene_description": "This is a panorama. A surreal painting with one large floating clock at the center, surrounded by distorted shapes and dreamlike colors.",
+    "prompt": "将漂浮时钟替换为复古怀表"
+  },
+  {
+    "scene_id": "scene_16",
+    "object_label": "sofa",
+    "scene_description": "This is a panorama. A quiet study room with one large wooden desk at the center, surrounded by bookshelves, a chair, table lamps, paper stacks, and soft indoor lighting.",
+    "prompt": "将木质沙发替换为皮质沙发"
+  },
+  {
+    "scene_id": "scene_17",
+    "object_label": "shelf",
+    "scene_description": "This is a panorama. A pantry room with one large storage shelf at the center, surrounded by jars, baskets, boxes, counters, and bright overhead lights.",
+    "prompt": "将储物架替换为实木书架"
+  },
+  {
+    "scene_id": "scene_18",
+    "object_label": "robot dog",
+    "scene_description": "This is a panorama. A robotics classroom with a large robot dog at the center, surrounded by student desks, toolkits, laptops, charging stations, and bright indoor lights.",
+    "prompt": "将机器狗替换为六足蜘蛛机器人"
+  },
+  {
+    "scene_id": "scene_19",
+    "object_label": "autonomous car",
+    "scene_description": "This is a panorama. A futuristic garage centered around a sleek silver autonomous car parked in the middle, surrounded by tool stations, charging cables, engineers, and glowing wall panels.",
+    "prompt": "将自动驾驶汽车替换为复古跑车"
+  },
+  {
+    "scene_id": "scene_20",
+    "object_label": "departure board",
+    "scene_description": "This is a panorama. An airport lounge centered around a large digital departure board suspended in the middle, with travelers, luggage, seats, glass walls, and bright modern lighting.",
+    "prompt": "将出发航班信息板替换为LED数字显示屏"
+  },
+  {
+    "scene_id": "scene_21",
+    "object_label": "traffic light",
+    "scene_description": "This is a panorama. A road intersection with one large traffic light at the center, surrounded by cars, signs, buildings, and sidewalks.",
+    "prompt": "将交通信号灯替换为智能信号灯柱"
+  },
+  {
+    "scene_id": "scene_22",
+    "object_label": "suitcase",
+    "scene_description": "This is a panorama. A travel lounge with a large suitcase at the center, surrounded by airport seats, charging stations, glass walls, signs, and bright terminal lighting.",
+    "prompt": "将旅行箱替换为复古皮革旅行包"
+  },
+  {
+    "scene_id": "scene_23",
+    "object_label": "crystal",
+    "scene_description": "This is a panorama. A digital painting with one large crystal at the center, surrounded by light reflections and gradients.",
+    "prompt": "将水晶替换为深红色红宝石"
+  },
+  {
+    "scene_id": "scene_24",
+    "object_label": "refrigerator",
+    "scene_description": "This is a panorama. A kitchen with a large silver refrigerator at the center, surrounded by counters, cabinets, cooking tools, a dining table, and warm ceiling lights.",
+    "prompt": "将银色冰箱替换为黑色冰箱"
+  },
+  {
+    "scene_id": "scene_25",
+    "object_label": "chalkboard",
+    "scene_description": "This is a panorama. A school classroom with one large green chalkboard at the center, surrounded by desks, chairs, backpacks, bookshelves, and bright fluorescent lights.",
+    "prompt": "将绿色黑板替换为电子白板"
+  },
+  {
+    "scene_id": "scene_26",
+    "object_label": "bathtub",
+    "scene_description": "This is a panorama. A bathroom with one large white bathtub at the center, surrounded by towels, cabinets, mirrors, plants, and soft warm lighting.",
+    "prompt": "将白色浴缸替换为现代独立式浴缸"
+  },
+  {
+    "scene_id": "scene_27",
+    "object_label": "mannequin",
+    "scene_description": "This is a panorama. A hospital clinic with one large X-ray machine at the center, surrounded by cabinets, monitors, rolling stools, trays, and bright medical lighting.",
+    "prompt": "将人体模型替换为医学骨骼标本模型"
+  },
+  {
+    "scene_id": "scene_28",
+    "object_label": "blender",
+    "scene_description": "This is a panorama. A kitchen with one large blender at the center, surrounded by counters, cabinets, fruit bowls, cups, and warm indoor lighting.",
+    "prompt": "将搅拌机替换为咖啡机"
+  },
+  {
+    "scene_id": "scene_29",
+    "object_label": "kitchen island",
+    "scene_description": "This is a panorama. A modern kitchen centered around a large marble cooking island with a shiny silver oven built into it, surrounded by cabinets, vegetables, pans, and warm pendant lights.",
+    "prompt": "将厨房岛台替换为大理石厨房岛台"
+  },
+  {
+    "scene_id": "scene_30",
+    "object_label": "treadmill",
+    "scene_description": "This is a panorama. A gym with a large treadmill at the center, surrounded by weight racks, mirrors, benches, water bottles, and bright ceiling lights.",
+    "prompt": "将跑步机替换为动感单车"
+  }
+]

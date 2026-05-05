@@ -6,12 +6,28 @@
 
 ### Background and Motivation
 
-360° panoramic images in Equirectangular Projection (ERP) format are increasingly used in virtual classrooms, immersive training scenarios, and educational VR environments. Editing these panoramas with natural-language instructions poses two fundamental challenges that standard image-editing models (trained on perspective photographs) fail to address:
+360° panoramic images in Equirectangular Projection (ERP) format are increasingly used in virtual classrooms, immersive training scenarios, and  VR environments. Editing these panoramas with natural-language instructions poses two fundamental challenges that standard image-editing models (trained on perspective photographs) fail to address:
 
 1. **Geometric distortion**: ERP maps a sphere onto a flat canvas, introducing severe latitude-dependent stretching near the poles. Any content synthesised without awareness of this projection will appear warped or inconsistent when viewed as a spherical scene.
-2. **Pedagogical semantic constraints**: Educational scenes contain hierarchical object relationships (teacher, whiteboard, instruments, students, …) that must be preserved or respected when an edit request alters part of the scene. Ignoring these relations breaks the pedagogical intent.
+2. **Pedagogical semantic constraints**:  scenes contain hierarchical object relationships (teacher, whiteboard, instruments, students, …) that must be preserved or respected when an edit request alters part of the scene. Ignoring these relations breaks the pedagogical intent.
 
 This project introduces a **parameter-efficient dual-branch LoRA adaptation** of the frozen **Qwen-Image-Edit-2511** vision-language model that simultaneously handles both challenges — without any paired before/after editing supervision.
+
+---
+
+### Formal Problem Definition
+
+Let $I \in \mathbb{R}^{H \times W \times 3}$ be an ERP panorama of resolution $H \times W$ (typically $1024 \times 2048$) and $t$ a natural-language editing instruction. The goal is to learn a function
+
+$$\hat{I} = f_\Theta(I, t)$$
+
+such that $\hat{I}$ satisfies three simultaneous constraints:
+
+1. **Instruction fidelity**: the semantically targeted region is edited according to $t$.
+2. **ERP geometric consistency**: for every perspective viewpoint $\mathbf{v} = (\phi, \lambda, \text{FoV})$, the perspective rendering $\pi_\mathbf{v}(\hat{I})$ is free of latitude-induced distortion artefacts.
+3. **Pedagogical semantic preservation**: all AESG-specified spatial relations and physical affiliations among scene objects remain satisfied in $\hat{I}$.
+
+Because no paired dataset $\{(I, t, I^*)\}$ exists for  ERP scenes, $f_\Theta$ is learned via **self-supervised reconstruction**: a degraded version $\tilde{I}$ is created by masking a detected object region, and the model is trained to reconstruct $I$ from $(\tilde{I}, t_\text{recon})$.
 
 ---
 
@@ -83,14 +99,14 @@ User instruction + ERP panorama
 | Module | Location | Responsibility |
 |--------|----------|----------------|
 | **Dual-LoRA core** | `lora/` | All LoRA parameter modules: distortion encoder, FiLM conditioning, conditional LoRA layer, LoRA-Pano, LoRA-AESG, adaptive gating, fusion orchestrator |
-| **AESG schema & encoder** | `aesg/` | Typed dataclass schema for the Anchor-centred Educational Scene Graph; GNN-style token encoder that maps graph nodes/edges → z_G |
+| **AESG schema & encoder** | `aesg/` | Typed dataclass schema for the Anchor-centred  Scene Graph; GNN-style token encoder that maps graph nodes/edges → z_G |
 | **Scene graph parser** | `scene_graph/` | LangChain + Qwen-max LLM wrapper that converts a free-text editing instruction into a structured AESG JSON, incorporating Physical Affiliation Analysis (PAA) and SE360 spatial reasoning |
 | **ERP data utilities** | `data/` | Sphere ↔ perspective projection helpers (ERP ↔ gnomonic), mask dilation, self-supervised degradation pipeline, PyTorch Dataset |
 | **Panorama editing pipeline** | `panorama_editing/` | Qwen-Image-Edit-2511 pipeline wrapper (`qwen_image_editing/`), ERP reprojection back to full panorama, ROI localisation via Grounded-SAM |
 | **HCFM fusion module** | `modules/hcfm.py` | Hierarchical Condition Fusion: prepends AESG branch tokens (anchor / object / context / relation) to the text hidden states feeding cross-attention |
 | **Training** | `training/` | Two-stage trainers with full loss suite (MSE + VGG perceptual + SSIM + panorama reprojection + AESG semantic losses) |
 | **Inference** | `inference/` | `PanoramaEditorWithLoRA` — 8-step end-to-end pipeline with CLI; saves intermediate crops and gate-value meta JSON |
-| **Panorama generation** | `panorama_generation/` | Separate Flux-based diffusion pipeline (CLIP + T5 + VAE + FluxTransformer2D) for unconditional 360° panorama synthesis |
+| **Panorama generation** | `panorama_generation/` | Separate DiT360-based diffusion pipeline for unconditional 360° ERP panorama synthesis |
 | **Configs** | `configs/` | YAML configuration for branch flags, loss weights, ROI thresholds, and FoV defaults |
 | **Tests** | `tests/` | End-to-end smoke tests for the AESG pipeline |
 
@@ -102,14 +118,14 @@ User instruction + ERP panorama
 |-------|---------------|
 | **Editing backbone** | Qwen-Image-Edit-2511 (7 B VLM, fully frozen during LoRA training) |
 | **Scene understanding LLM** | Qwen-max via LangChain + OpenAI-compatible API |
-| **Panorama generation** | Flux diffusion pipeline (FluxTransformer2D, CLIP, T5, VAE) via Diffusers |
+| **Panorama generation** | DiT360 diffusion pipeline (Diffusion Transformer for 360° ERP synthesis) |
 | **Object detection / ROI** | Grounded-SAM (GroundingDINO + SAM) |
 | **LoRA conditioning** | FiLM (Feature-wise Linear Modulation) |
 | **Perceptual loss** | VGG-16 (relu1\_2, relu2\_2, relu3\_3) |
 | **Image quality metrics** | SSIM (differentiable), LPIPS, FID, CLIP Score |
 | **Deep learning framework** | PyTorch 2.x |
 | **Configuration** | YAML (`configs/aesg_edit.yaml`) |
-| **Environment** | Conda `panorama`; single NVIDIA A100 40 GB sufficient |
+| **Environment** | Conda `panorama`; single NVIDIA H100 NVL 96 GB (training); L40S 48 GB sufficient for inference |
 
 ---
 
@@ -186,15 +202,6 @@ Two training stages are applied sequentially:
 
 ---
 
-A parameter-efficient adaptation strategy for editing 360° panoramic images (ERP format) using two complementary LoRA branches injected into the cross-attention layers of **Qwen-Image-Edit-2511**:
-
-- **LoRA-Pano** — encodes panoramic geometric priors (latitude-dependent distortion, FoV, projection centre) so edited content is geometrically consistent with ERP space.
-- **LoRA-AESG** — encodes structural educational semantics from the Anchor-centred Educational Scene Graph (AESG) so the model respects hierarchical scene constraints.
-
-An **adaptive gating network** dynamically fuses both branches based on task type and spatial position. The entire backbone remains frozen; only the LoRA parameters (~0.2–0.6 % of the model) are trained via a **self-supervised reconstruction** paradigm.
-
----
-
 ## Repository structure
 
 ```
@@ -236,18 +243,72 @@ vlm_panorama/
 
 ## Method overview
 
-### Adapted weight formula
+### 1. AESG Graph Structure
 
-```
-W' = W + γ_p · ΔW_pano(θ) + γ_s · ΔW_aesg(Z_G)
-```
+The **Anchor-centred  Scene Graph** $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ has four node types and one edge type:
 
-| Component | Condition input | Learning target |
-|-----------|----------------|-----------------|
-| LoRA-Pano | Projection θ | ERP distortion patterns, latitude geometry |
-| LoRA-AESG | AESG tokens Z_G | Structural semantic control |
-| Adaptive gating | θ + Z_G + task | Dynamic branch balancing |
-| Backbone W | (frozen) | Base editing capability |
+| Node type | Dataclass | Role |
+|-----------|-----------|------|
+| **Anchor** $v_a$ | `Anchor` | Scene-level context: `scene_type`, `teaching_stage`, `global_style` |
+| **CoreObject** $v_c^{(i)}$ | `CoreObject` | Editable object: `object_id`, `function`, `edit_type ∈ {replace, preserve, modify}`, `physical_parent` |
+| **ContextObject** $v_x^{(j)}$ | `ContextObject` | Background element: `support_role`, `visual_neighborhood` |
+| **Relation** $e_{ij}$ | `Relation` | Directed edge: `relation_type`, `direction`, `distance`, `affiliation_type ∈ {physical, contextual}` |
+
+The graph encoder (GNN-style MLP in `aesg/encoder.py`) maps $\mathcal{G} \rightarrow \mathbf{z}_G \in \mathbb{R}^{512}$.
+
+---
+
+### 2. Distortion Encoder
+
+Projection parameters $\boldsymbol{\theta} = (\phi, \lambda, \text{FoV})$ — latitude, longitude, and field-of-view of the perspective crop centre — are normalised to $[-1, 1]$ and encoded via sinusoidal positional embedding followed by a 3-layer MLP:
+
+$$\varphi(x) = \left[\sin(2^0\pi x),\; \cos(2^0\pi x),\; \ldots,\; \sin(2^{L-1}\pi x),\; \cos(2^{L-1}\pi x)\right] \in \mathbb{R}^{2L}$$
+
+$$\mathbf{z}_\theta = \text{MLP}_\text{dist}\!\left([\varphi(\phi_n)\,\|\,\varphi(\lambda_n)\,\|\,\varphi(\text{FoV}_n)]\right) \in \mathbb{R}^{512}$$
+
+where $L = 8$ frequency bands, giving a $6L = 48$-dimensional input to the MLP (hidden dim 256, GELU activations, Xavier init).
+
+---
+
+### 3. FiLM Conditioning & Adapted Weight Formula
+
+Each LoRA branch uses **Feature-wise Linear Modulation (FiLM)** to inject its condition into the down-projection matrix $A$:
+
+$$\text{FiLM}(\mathbf{h};\,\mathbf{z}) = \bigl(1 + \gamma(\mathbf{z})\bigr)\odot\mathbf{h} + \beta(\mathbf{z})$$
+
+where $[\gamma(\mathbf{z})\,\|\,\beta(\mathbf{z})] = \text{MLP}_\text{FiLM}(\mathbf{z}) \in \mathbb{R}^{2d}$ and both $\gamma, \beta$ are initialised to zero (identity map at initialisation).
+
+The final modulated weight update for each cross-attention linear layer is:
+
+$$W' = W + \gamma_p \cdot \underbrace{B_p\,\text{FiLM}(A_p;\,\mathbf{z}_\theta)}_{\Delta W_\text{pano}} + \gamma_s \cdot \underbrace{B_s\,\text{FiLM}(A_s;\,\mathbf{z}_G)}_{\Delta W_\text{aesg}}$$
+
+| Component | Condition | Trainable params | Learning target |
+|-----------|-----------|-----------------|-----------------|
+| $\Delta W_\text{pano}$ (LoRA-Pano) | $\mathbf{z}_\theta$ | $A_p, B_p$, FiLM$_p$ | ERP latitude-dependent distortion |
+| $\Delta W_\text{aesg}$ (LoRA-AESG) | $\mathbf{z}_G$ | $A_s, B_s$, FiLM$_s$ | Structural semantic constraints |
+| Adaptive gating $(\gamma_p, \gamma_s)$ | $\mathbf{z}_\theta, \mathbf{z}_G, \mathbf{e}_\text{task}$ | MLP$_\text{gate}$ | Branch balancing |
+| Backbone $W$ | — | **frozen** | Base editing capability |
+
+---
+
+### 4. Adaptive Gating Network
+
+$$[\gamma_p,\; \gamma_s] = \sigma\!\left(\text{MLP}_\text{gate}\!\left([\mathbf{z}_\theta\,\|\,\mathbf{z}_G\,\|\,\mathbf{e}_\text{task}]\right)\right) \in (0,1)^2$$
+
+- Input dimension: $512 + 512 + 64 = 1088$; hidden dims: $256 \to 128 \to 2$.
+- **Sigmoid** (not softmax): the two branches encode complementary information and should be able to activate independently.
+- Bias of the final linear layer initialised to $\text{logit}(0.5) = 0$ so both gates start at 0.5.
+- $\mathbf{e}_\text{task} \in \mathbb{R}^{64}$: learned embedding for task type $\in \{\text{reconstruct}, \text{inpaint}\}$.
+
+---
+
+### 5. HCFM Token Injection
+
+The **Hierarchical Condition Fusion Module** (`modules/hcfm.py`) prepends AESG branch tokens to the text hidden states before each cross-attention layer:
+
+$$\tilde{\mathbf{H}}_\text{text} = \left[\mathbf{T}_\text{anchor}\,\|\,\mathbf{T}_\text{object}\,\|\,\mathbf{T}_\text{context}\,\|\,\mathbf{T}_\text{relation}\,\|\,\mathbf{H}_\text{text}\right]$$
+
+Each branch token set is scaled by a configurable scalar (`anchor_branch_scale`, etc., default 0.05) before concatenation. All four branches can be independently enabled/disabled via `configs/aesg_edit.yaml`. The extended sequence $\tilde{\mathbf{H}}_\text{text}$ is used as keys/values in cross-attention; the attention mask is extended accordingly.
 
 ### Self-supervised training paradigm
 
@@ -258,12 +319,37 @@ No paired before/after editing data is required. For each scene:
 3. The model learns to reconstruct the original from the degraded input.
 4. Because GT is a real panoramic image, the model inherently learns panorama-consistent generation.
 
-### Two-stage training
+### Two-stage training with complete loss formulas
+
+**Stage 1** trains only LoRA-Pano and the distortion encoder:
+
+$$\mathcal{L}_\text{stage1} = \mathcal{L}_\text{recon} + \lambda_\text{pano}\,\mathcal{L}_\text{pano}$$
+
+$$\mathcal{L}_\text{recon} = \|\hat{I}_p - I_p\|_2^2 + \lambda_\text{perc}\sum_{l}\|F_l(\hat{I}_p) - F_l(I_p)\|_1 + \lambda_\text{ssim}(1 - \text{SSIM}(\hat{I}_p, I_p))$$
+
+where $F_l$ denotes VGG-16 feature maps at layers relu1\_2, relu2\_2, relu3\_3.
+
+$$\mathcal{L}_\text{pano} = \frac{1}{|\mathcal{M}|}\sum_{(u,v)\in\mathcal{M}} \cos(\phi_{uv})\,\|\hat{I}_p(u,v) - I_p(u,v)\|_1$$
+
+where $\phi_{uv}$ is the ERP latitude of perspective pixel $(u,v)$ via the sample map, and $\cos(\phi_{uv})$ weights by solid angle so polar-region pixels receive lower weight, providing a geometric signal absent from flat-pixel losses.
+
+**Stage 2** jointly trains LoRA-AESG and the gating network (LoRA-Pano continues at $\frac{1}{10}$ base LR):
+
+$$\mathcal{L}_\text{stage2} = \lambda_1\mathcal{L}_\text{recon} + \lambda_2\mathcal{L}_\text{rel} + \lambda_3\mathcal{L}_\text{aff} + \lambda_4\mathcal{L}_\text{ctx} + \lambda_5\mathcal{L}_\text{seam} + \lambda_6\mathcal{L}_\text{pano}$$
+
+| Loss term | Formula | Supervises |
+|-----------|---------|-----------|
+| $\mathcal{L}_\text{rel}$ | $\|(\hat{I}_p - I_p)\odot\mathbf{M}_\text{rel}\|_1 / \|\mathbf{M}_\text{rel}\|_1$ | Spatial relations between AESG objects |
+| $\mathcal{L}_\text{aff}$ | same form with $\mathbf{M}_\text{aff}$ | Physical affiliation completeness |
+| $\mathcal{L}_\text{ctx}$ | $\|\mathbf{G}(\hat{I}_p\odot(1{-}\mathbf{M})) - \mathbf{G}(I_p\odot(1{-}\mathbf{M}))\|_F^2$ | Gram-matrix style consistency with context region |
+| $\mathcal{L}_\text{seam}$ | $\|\hat{I}_{:,:,0} - \hat{I}_{:,:,-1}\|_1$ | ERP left-right boundary continuity |
+
+Default weights: $\lambda_1{=}1.0,\;\lambda_2{=}\lambda_3{=}\lambda_4{=}0.25,\;\lambda_5{=}0.1,\;\lambda_6{=}0.3$; $\lambda_\text{perc}{=}0.1$, $\lambda_\text{ssim}{=}0.1$.
 
 | Stage | Trains | Loss |
 |-------|--------|------|
-| 1 | LoRA-Pano + distortion encoder | L_recon + λ_pano · L_pano |
-| 2 | LoRA-AESG + gating (LoRA-Pano at 10× lower LR) | λ₁L_recon + λ₂L_rel + λ₃L_aff + λ₄L_ctx + λ₅L_seam + λ₆L_pano |
+| 1 | LoRA-Pano + distortion encoder | $\mathcal{L}_\text{recon} + 0.3\,\mathcal{L}_\text{pano}$ |
+| 2 | LoRA-AESG + gating (LoRA-Pano at 10× lower LR) | $\mathcal{L}_\text{stage2}$ (6 terms above) |
 
 ---
 
@@ -362,11 +448,15 @@ python -m inference.edit_with_lora \
     --stage2_ckpt ./checkpoints/stage2/best_checkpoint.pt \
     --output output_edited.jpg \
     --save_intermediates
+```
 
+For side-by-side baseline vs. Dual-LoRA comparison:
 
-    python run_comparison.py \
+```bash
+python run_comparison.py \
     --input /users/2522553y/liangyue_ws/panorama_test/desk/result.png \
-    --prompt "请将桌子材质替换为铝合金材质"
+    --prompt "请将桌子材质替换为铝合金材质" \
+    --stage2_ckpt ./checkpoints/stage2/best_checkpoint.pt
 ```
 
 With `--save_intermediates` the script additionally saves:
@@ -414,7 +504,6 @@ editor = PanoramaEditorWithLoRA(
 result = editor.edit(
     panorama="data/train/scene_000/panorama.jpg",
     prompt="Replace the bench with a modern lab workstation",
-    fov=90.0,
     task_type="inpaint",
     save_intermediates=True,
 )
@@ -434,7 +523,7 @@ result["edited_panorama"].save("output_edited.jpg")
 | Gating network | ~0.1–0.5 M | < 0.01 % |
 | **Total trainable** | **~9–22 M** | **~0.13–0.32 %** |
 
-Single A100 40 GB is sufficient for training.
+Training was conducted on a single NVIDIA H100 NVL (96 GB). Inference runs on an L40S (48 GB) or larger.
 
 ---
 
@@ -444,7 +533,7 @@ Single A100 40 GB is sufficient for training.
 |-----------|--------|-------------|
 | Visual quality | FID, LPIPS, SSIM, CLIP Score | Generation quality and instruction following |
 | Panoramic consistency | SDS, RE, Lat-FID | Boundary continuity, reprojection error, latitude robustness |
-| Educational semantics | OPA, RSR, ACS | Object placement, relation satisfaction, affiliation completeness |
+| Panoramic semantics | OPA, RSR, ACS | Object placement, relation satisfaction, affiliation completeness |
 | Mask quality | Mask IoU, Leakage Rate | Mask precision and edit containment |
 | Human | Educator Rating (1–5) | Pedagogical appropriateness |
 
